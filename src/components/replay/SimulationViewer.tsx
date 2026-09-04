@@ -22,17 +22,16 @@ function SimulationViewer() {
     state,
     error,
     telemetry,
+    fullTrajectory,
     togglePlayPause,
     seek,
     skip,
     setPlaybackRate,
     getCurrentVehicleState,
-    getTrajectory,
   } = useReplay(simulationUrl);
 
   const { fps, measureFrame } = useFrameRate();
   const [currentVehicleState, setCurrentVehicleState] = useState<VehicleState | null>(null);
-  const [trajectorySet, setTrajectorySet] = useState(false);
 
   // Initialize Three.js scene
   useEffect(() => {
@@ -46,23 +45,42 @@ function SimulationViewer() {
     };
   }, []);
 
-  // Set trajectory when data is loaded
+  // Set full trajectory when loaded
   useEffect(() => {
-    if (!state.isLoading && !trajectorySet && sceneRef.current) {
-      const trajectory = getTrajectory();
-      if (trajectory.length > 0) {
-        sceneRef.current.setTrajectory(trajectory);
-        setTrajectorySet(true);
-      }
+    if (sceneRef.current && fullTrajectory.length > 0) {
+      sceneRef.current.setTrajectory(fullTrajectory);
+      // Debug: log trajectory info
+      const first = fullTrajectory[0];
+      const last = fullTrajectory[fullTrajectory.length - 1];
+      console.log(`Trajectory loaded: ${fullTrajectory.length} points`);
+      console.log(`  First point: (${first.x.toFixed(2)}, ${first.y.toFixed(2)}, ${first.z.toFixed(2)})`);
+      console.log(`  Last point: (${last.x.toFixed(2)}, ${last.y.toFixed(2)}, ${last.z.toFixed(2)})`);
     }
-  }, [state.isLoading, trajectorySet, getTrajectory]);
+  }, [fullTrajectory]);
 
   // Animation loop
   useEffect(() => {
+    let lastLogTime = 0;
+
     const animate = () => {
       // Get current vehicle state
       const vehicleState = getCurrentVehicleState();
       setCurrentVehicleState(vehicleState);
+
+      // Debug: log vehicle state periodically
+      const now = performance.now();
+      if (now - lastLogTime > 2000) {
+        lastLogTime = now;
+        if (vehicleState) {
+          console.log('Vehicle state:', {
+            time: vehicleState.timestamp.toFixed(2),
+            pos: `(${vehicleState.position.x.toFixed(2)}, ${vehicleState.position.y.toFixed(2)}, ${vehicleState.position.z.toFixed(2)})`,
+            speed: vehicleState.speed.toFixed(2),
+          });
+        } else {
+          console.log('Vehicle state: null (no data loaded for current time)');
+        }
+      }
 
       // Update Three.js scene
       if (sceneRef.current) {

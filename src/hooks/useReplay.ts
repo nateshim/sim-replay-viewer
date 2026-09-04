@@ -9,7 +9,7 @@ export function useReplay(simulationUrl: string | null) {
   const engineRef = useRef<ReplayEngine | null>(null);
   const [state, setState] = useState<ReplayState>({
     currentTime: 0,
-    duration: 60,
+    duration: 0,
     isPlaying: false,
     playbackRate: 1,
     isLoading: false,
@@ -17,12 +17,12 @@ export function useReplay(simulationUrl: string | null) {
   });
   const [error, setError] = useState<string | null>(null);
   const [telemetry, setTelemetry] = useState<TelemetryPoint[]>([]);
+  const [fullTrajectory, setFullTrajectory] = useState<Array<{ x: number; y: number; z: number }>>([]);
 
   // Initialize engine
   useEffect(() => {
-    engineRef.current = new ReplayEngine();
-
-    const engine = engineRef.current;
+    const engine = new ReplayEngine();
+    engineRef.current = engine;
 
     // Subscribe to state changes
     engine.on('stateChange', (newState) => {
@@ -38,25 +38,57 @@ export function useReplay(simulationUrl: string | null) {
     });
 
     return () => {
+      engineRef.current = null;
       engine.dispose();
     };
   }, []);
 
   // Load simulation when URL changes
   useEffect(() => {
-    if (!simulationUrl || !engineRef.current) return;
+    const engine = engineRef.current;
+    if (!simulationUrl || !engine) return;
+
+    let cancelled = false;
 
     const loadSim = async () => {
       try {
         setError(null);
-        await engineRef.current!.loadSimulation(simulationUrl);
-        setTelemetry(engineRef.current!.getTelemetry());
+        await engine.loadSimulation(simulationUrl);
+
+        // Check if effect was cleaned up during async operation
+        if (cancelled) return;
+
+        setTelemetry(engine.getTelemetry());
+
+        // Load full trajectory for visualization (don't block on errors)
+        console.log('useReplay: Loading full trajectory...');
+        try {
+          const trajectory = await engine.loadFullTrajectory();
+          console.log('useReplay: Got trajectory with', trajectory.length, 'points');
+          if (cancelled) return;
+          if (trajectory.length > 0) {
+            setFullTrajectory(trajectory);
+            console.log('useReplay: Trajectory state updated');
+          } else {
+            console.warn('useReplay: Trajectory is empty');
+          }
+        } catch (trajErr) {
+          console.error('useReplay: Failed to load trajectory:', trajErr);
+          // Don't fail the whole load, just skip trajectory
+        }
       } catch (err) {
+        // Check if effect was cleaned up during async operation
+        if (cancelled) return;
+
         setError(err instanceof Error ? err.message : 'Failed to load simulation');
       }
     };
 
     loadSim();
+
+    return () => {
+      cancelled = true;
+    };
   }, [simulationUrl]);
 
   const play = useCallback(() => {
@@ -91,12 +123,11 @@ export function useReplay(simulationUrl: string | null) {
     return engineRef.current?.getTrajectory() ?? [];
   }, []);
 
-  const getEngine = useCallback(() => engineRef.current, []);
-
   return {
     state,
     error,
     telemetry,
+    fullTrajectory,
     play,
     pause,
     togglePlayPause,
@@ -105,6 +136,5 @@ export function useReplay(simulationUrl: string | null) {
     setPlaybackRate,
     getCurrentVehicleState,
     getTrajectory,
-    getEngine,
   };
 }

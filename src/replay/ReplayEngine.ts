@@ -1,19 +1,25 @@
 import type { ReplayState, VehicleState, TelemetryPoint } from '../types';
 import { MCAPLoader } from '../mcap/loader';
 
-export type ReplayEventType = 'stateChange' | 'timeUpdate' | 'loaded' | 'error';
+export type ReplayEventType = 'stateChange' | 'timeUpdate' | 'loaded' | 'error' | 'dataLoading';
 export type ReplayEventCallback = (data: unknown) => void;
 
 /**
  * Core replay engine that manages simulation playback
  * Separates simulation time from render time per AGENTS.md
+ * Uses chunked loading - only loads data as needed
  */
 export class ReplayEngine {
   private loader: MCAPLoader | null = null;
   private state: ReplayState;
   private lastUpdateTime: number = 0;
+  private lastStateEmitTime: number = 0;
   private animationFrameId: number | null = null;
   private eventListeners: Map<ReplayEventType, Set<ReplayEventCallback>> = new Map();
+  private prefetchScheduled: boolean = false;
+
+  // Throttle React state updates to ~10 per second
+  private readonly STATE_EMIT_INTERVAL = 100;
 
   constructor() {
     this.state = {
@@ -28,6 +34,7 @@ export class ReplayEngine {
 
   /**
    * Load MCAP file from URL
+   * Uses chunked loading - only loads index and initial chunk
    */
   async loadSimulation(url: string): Promise<void> {
     this.updateState({ isLoading: true });
@@ -40,17 +47,29 @@ export class ReplayEngine {
         this.loader = null;
       }
 
-      this.loader = new MCAPLoader(url);
+      const loader = new MCAPLoader(url);
+      this.loader = loader;
 
-      // Load index first
-      const index = await this.loader.loadIndex();
+      // Load index first (fast - metadata only)
+      const index = await loader.loadIndex();
+
+      // Check if disposed during async operation
+      if (this.loader !== loader) {
+        return; // Engine was disposed or new load started
+      }
+
       this.updateState({
         duration: index.duration,
         currentTime: 0,
       });
 
-      // Load all data
-      await this.loader.loadAllData();
+      // Load initial chunk (around time 0)
+      await loader.loadTimeRange(0);
+
+      // Check if disposed during async operation
+      if (this.loader !== loader) {
+        return; // Engine was disposed or new load started
+      }
 
       this.updateState({ isLoading: false });
       this.emit('loaded', { duration: index.duration });
@@ -98,6 +117,7 @@ export class ReplayEngine {
 
   /**
    * Seek to specific time
+   * Loads data for the target time if not already loaded
    */
   seek(time: number): void {
     const clampedTime = Math.max(0, Math.min(time, this.state.duration));
@@ -108,10 +128,23 @@ export class ReplayEngine {
     this.emit('timeUpdate', { currentTime: clampedTime });
     this.emit('stateChange', this.state);
 
-    // Reset seeking flag after a short delay
-    requestAnimationFrame(() => {
-      this.updateState({ isSeeking: false });
-    });
+    // Load data for the seek target if needed
+    if (this.loader && !this.loader.hasDataForTime(clampedTime)) {
+      this.emit('dataLoading', { time: clampedTime });
+      this.loader.loadTimeRange(clampedTime).then(() => {
+        this.updateState({ isSeeking: false });
+        this.emit('stateChange', this.state);
+      }).catch((err) => {
+        console.warn('Failed to load data for seek:', err);
+        this.updateState({ isSeeking: false });
+        this.emit('stateChange', this.state);
+      });
+    } else {
+      // Data already loaded, reset seeking flag after a short delay
+      requestAnimationFrame(() => {
+        this.updateState({ isSeeking: false });
+      });
+    }
   }
 
   /**
@@ -159,6 +192,13 @@ export class ReplayEngine {
   }
 
   /**
+   * Load the complete trajectory for the entire simulation
+   */
+  async loadFullTrajectory(): Promise<Array<{ x: number; y: number; z: number }>> {
+    return this.loader?.loadFullTrajectory() ?? [];
+  }
+
+  /**
    * Subscribe to events
    */
   on(event: ReplayEventType, callback: ReplayEventCallback): void {
@@ -201,6 +241,7 @@ export class ReplayEngine {
 
   /**
    * Start the animation loop
+   * Handles chunked loading and prefetching during playback
    */
   private startAnimationLoop(): void {
     if (this.animationFrameId !== null) return;
@@ -226,8 +267,32 @@ export class ReplayEngine {
         return;
       }
 
+      // Check if we need to load data for current time
+      if (this.loader && !this.loader.hasDataForTime(newTime)) {
+        // Pause briefly while loading
+        this.loader.loadTimeRange(newTime).catch((err) => {
+          console.warn('Failed to load data during playback:', err);
+        });
+      }
+
+      // Schedule prefetch for upcoming data (don't block current frame)
+      if (!this.prefetchScheduled && this.loader) {
+        this.prefetchScheduled = true;
+        // Use setTimeout to avoid blocking the animation frame
+        setTimeout(() => {
+          this.loader?.prefetchRange(this.state.currentTime, this.state.playbackRate);
+          this.prefetchScheduled = false;
+        }, 0);
+      }
+
       this.updateState({ currentTime: newTime });
       this.emit('timeUpdate', { currentTime: newTime });
+
+      // Throttle React state updates to avoid excessive re-renders
+      if (now - this.lastStateEmitTime >= this.STATE_EMIT_INTERVAL) {
+        this.lastStateEmitTime = now;
+        this.emit('stateChange', this.state);
+      }
 
       this.animationFrameId = requestAnimationFrame(loop);
     };

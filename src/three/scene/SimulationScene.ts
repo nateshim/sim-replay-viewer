@@ -15,14 +15,24 @@ export class SimulationScene {
   private grid: THREE.GridHelper;
   private axesHelper: THREE.AxesHelper;
 
-  // Camera follow settings
-  private cameraOffset = new THREE.Vector3(0, 50, 80);
-  private cameraLookOffset = new THREE.Vector3(0, 0, 0);
+  // Camera follow settings - positioned behind and above the vehicle
+  // After base rotation (+90° around Y), offset is transformed:
+  // (0, 10, -25) → (-25, 10, 0) = behind car facing +X
+  // (0, 2, 30) → (30, 2, 0) = in front of car facing +X
+  private cameraOffset = new THREE.Vector3(0, 10, -25); // Behind the car model (+Z forward)
+  private cameraLookAhead = new THREE.Vector3(0, 2, 30); // In front of the car model
   private followVehicle = true;
+  private cameraLerpFactor = 0.1; // Smooth camera movement
 
   // Reusable objects to avoid allocation in render loop
   private tempPosition = new THREE.Vector3();
   private tempQuaternion = new THREE.Quaternion();
+  private tempCameraPos = new THREE.Vector3();
+  private tempLookAt = new THREE.Vector3();
+
+  // Base rotation to align car model (+Z forward) with NuScenes convention (+X forward at yaw=0)
+  // +90° around Y rotates +Z to +X
+  private baseRotation = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI / 2);
 
   constructor(container: HTMLElement) {
     // Scene
@@ -174,6 +184,7 @@ export class SimulationScene {
 
   /**
    * Update trajectory visualization
+   * Uses same coordinate conversion as vehicle position
    */
   setTrajectory(positions: Array<{ x: number; y: number; z: number }>): void {
     // Remove existing trajectory
@@ -181,50 +192,92 @@ export class SimulationScene {
       this.scene.remove(this.trajectory);
       this.trajectory.geometry.dispose();
       (this.trajectory.material as THREE.Material).dispose();
+      this.trajectory = null;
     }
 
-    if (positions.length < 2) return;
+    if (positions.length < 2) {
+      console.log('Trajectory: Not enough points', positions.length);
+      return;
+    }
 
-    // Create new trajectory line
-    const points = positions.map((p) => new THREE.Vector3(p.x, 0.2, -p.y));
+    // Create new trajectory line - convert NuScenes ENU to Three.js
+    // Slightly above ground (0.5) to be clearly visible
+    const points = positions.map((p) => new THREE.Vector3(p.x, (p.z || 0) + 0.5, -p.y));
+
+    // Debug: log converted coordinates
+    const first = points[0];
+    const last = points[points.length - 1];
+    console.log(`Trajectory: ${points.length} points`);
+    console.log(`  First Three.js: (${first.x.toFixed(2)}, ${first.y.toFixed(2)}, ${first.z.toFixed(2)})`);
+    console.log(`  Last Three.js: (${last.x.toFixed(2)}, ${last.y.toFixed(2)}, ${last.z.toFixed(2)})`);
+
     const geometry = new THREE.BufferGeometry().setFromPoints(points);
+
+    // Use a thicker line via LineBasicMaterial (note: linewidth > 1 only works on some systems)
+    // For better visibility, we'll use a bright color
     const material = new THREE.LineBasicMaterial({
-      color: 0x4da6ff,
+      color: 0x00ffff, // Cyan for better visibility
       linewidth: 2,
-      transparent: true,
-      opacity: 0.6,
     });
 
     this.trajectory = new THREE.Line(geometry, material);
     this.scene.add(this.trajectory);
+
+    console.log('Trajectory line added to scene with', points.length, 'points');
   }
 
   /**
    * Update vehicle state (called every frame)
+   * NuScenes uses ENU: X=East, Y=North, Z=Up
+   * Three.js uses: X=Right, Y=Up, Z=Towards viewer
    */
   updateVehicle(state: VehicleState | null): void {
     if (!state) return;
 
-    // Update position (swap Y and Z for Three.js coordinate system)
-    this.tempPosition.set(state.position.x, 0, -state.position.y);
+    // Convert NuScenes ENU to Three.js coordinate system
+    // Three.js X = NuScenes X (East)
+    // Three.js Y = NuScenes Z (Up) - but ground vehicles have Z≈0, so use small offset
+    // Three.js Z = -NuScenes Y (South, since Three.js Z points towards viewer)
+    this.tempPosition.set(
+      state.position.x,
+      state.position.z || 0,
+      -state.position.y
+    );
     this.vehicle.position.copy(this.tempPosition);
 
-    // Update rotation from quaternion
+    // Convert quaternion from NuScenes to Three.js
+    // NuScenes: rotation around Z-axis (up) for yaw
+    // Three.js: rotation around Y-axis (up) for yaw
+    //
+    // NuScenes quaternion (x, y, z, w) where rotation is around Z
+    // Three.js needs rotation around Y
     this.tempQuaternion.set(
-      state.rotation.x,
-      state.rotation.z,
-      -state.rotation.y,
-      state.rotation.w
+      state.rotation.x,   // X component (typically 0 for ground vehicles)
+      state.rotation.z,   // Z->Y: yaw rotation component
+      -state.rotation.y,  // Y->Z: pitch component (negated due to axis flip)
+      state.rotation.w    // W component stays the same
     );
+
+    // Apply base rotation to align car model with NuScenes convention
+    // Car model faces +Z, but NuScenes yaw=0 means facing +X
+    this.tempQuaternion.multiply(this.baseRotation);
     this.vehicle.quaternion.copy(this.tempQuaternion);
 
-    // Update camera if following
+    // Update camera to follow behind vehicle
     if (this.followVehicle) {
-      const targetPos = this.tempPosition.clone().add(this.cameraOffset);
-      this.camera.position.lerp(targetPos, 0.05);
+      // Calculate camera position: offset rotated by vehicle's orientation
+      this.tempCameraPos.copy(this.cameraOffset);
+      this.tempCameraPos.applyQuaternion(this.tempQuaternion);
+      this.tempCameraPos.add(this.tempPosition);
 
-      const lookTarget = this.tempPosition.clone().add(this.cameraLookOffset);
-      this.camera.lookAt(lookTarget);
+      // Calculate look-at target: ahead of vehicle
+      this.tempLookAt.copy(this.cameraLookAhead);
+      this.tempLookAt.applyQuaternion(this.tempQuaternion);
+      this.tempLookAt.add(this.tempPosition);
+
+      // Smooth camera movement
+      this.camera.position.lerp(this.tempCameraPos, this.cameraLerpFactor);
+      this.camera.lookAt(this.tempLookAt);
     }
   }
 
