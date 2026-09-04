@@ -1,0 +1,89 @@
+.telemetry-sidebar {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background: rgba(0, 0, 0, 0.3);
+  border-left: 1px solid rgba(255, 255, 255, 0.1);
+  overflow-y: auto;
+}
+
+.sidebar-header {
+  padding: 16px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.sidebar-header h2 {
+  font-size: 16px;
+  font-weight: 600;
+  color: #fff;
+  margin: 0;
+}
+
+.metrics-container {
+  flex: 1;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.metric-card {
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 8px;
+  padding: 12px;
+}
+
+.metric-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.metric-label {
+  font-size: 13px;
+  color: #888;
+  font-weight: 500;
+}
+
+.metric-value {
+  font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+  font-size: 14px;
+  color: #fff;
+  font-weight: 600;
+}
+
+.position-info {
+  padding: 16px;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.position-info h3 {
+  font-size: 13px;
+  font-weight: 500;
+  color: #888;
+  margin: 0 0 12px 0;
+}
+
+.position-values {
+  display: flex;
+  gap: 16px;
+}
+
+.position-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.pos-label {
+  font-size: 11px;
+  color: #666;
+  text-transform: uppercase;
+}
+
+.pos-value {
+  font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+  font-size: 13px;
+  color: #eaeaea;
+}

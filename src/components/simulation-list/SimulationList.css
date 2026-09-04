@@ -1,0 +1,128 @@
+.simulation-list-container {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+}
+
+.simulation-list-header {
+  padding: 32px 48px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.simulation-list-header h1 {
+  font-size: 28px;
+  font-weight: 600;
+  color: #fff;
+  margin-bottom: 8px;
+}
+
+.simulation-list-header .subtitle {
+  color: #888;
+  font-size: 14px;
+}
+
+.simulation-list-content {
+  flex: 1;
+  padding: 32px 48px;
+  overflow-y: auto;
+}
+
+.loading-state,
+.error-state,
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 300px;
+  color: #888;
+  gap: 16px;
+}
+
+.loading-spinner {
+  width: 40px;
+  height: 40px;
+  border: 3px solid rgba(77, 166, 255, 0.2);
+  border-top-color: #4da6ff;
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.error-state {
+  color: #ff6b6b;
+}
+
+.simulation-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 20px;
+}
+
+.simulation-card {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 20px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 12px;
+  transition: all 0.2s ease;
+  text-decoration: none;
+}
+
+.simulation-card:hover {
+  background: rgba(255, 255, 255, 0.1);
+  border-color: rgba(77, 166, 255, 0.5);
+  transform: translateY(-2px);
+  text-decoration: none;
+}
+
+.simulation-icon {
+  width: 48px;
+  height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: linear-gradient(135deg, #4da6ff 0%, #3d5a80 100%);
+  border-radius: 10px;
+  color: white;
+  flex-shrink: 0;
+}
+
+.simulation-icon svg {
+  width: 24px;
+  height: 24px;
+}
+
+.simulation-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.simulation-name {
+  font-size: 16px;
+  font-weight: 500;
+  color: #fff;
+  margin-bottom: 6px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.simulation-meta {
+  display: flex;
+  gap: 12px;
+  font-size: 13px;
+  color: #888;
+}
+
+.simulation-size {
+  color: #4da6ff;
+}

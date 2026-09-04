@@ -1,0 +1,12 @@
+.metric-plot {
+  width: 100%;
+  height: 60px;
+  background: rgba(0, 0, 0, 0.2);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.metric-plot canvas {
+  width: 100%;
+  height: 100%;
+}
