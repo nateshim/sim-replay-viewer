@@ -1,4 +1,5 @@
 import type { ReplayState, VehicleState, TelemetryPoint } from '../types';
+import type { MapData } from '../mcap/types';
 import { MCAPLoader } from '../mcap/loader';
 
 export type ReplayEventType = 'stateChange' | 'timeUpdate' | 'loaded' | 'error' | 'dataLoading';
@@ -196,6 +197,18 @@ export class ReplayEngine {
    */
   async loadFullTrajectory(): Promise<Array<{ x: number; y: number; z: number }>> {
     return this.loader?.loadFullTrajectory() ?? [];
+  }
+
+  /**
+   * Load map data (semantic map, drivable area, point cloud)
+   */
+  async loadMapData(): Promise<MapData> {
+    return this.loader?.loadMapData() ?? {
+      semanticMap: null,
+      drivableArea: null,
+      pointCloud: null,
+      markers: null,
+    };
   }
 
   /**

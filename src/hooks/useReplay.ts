@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import type { ReplayState, VehicleState, TelemetryPoint } from '../types';
+import type { MapData } from '../mcap/types';
 import { ReplayEngine } from '../replay/ReplayEngine';
 
 /**
@@ -18,6 +19,7 @@ export function useReplay(simulationUrl: string | null) {
   const [error, setError] = useState<string | null>(null);
   const [telemetry, setTelemetry] = useState<TelemetryPoint[]>([]);
   const [fullTrajectory, setFullTrajectory] = useState<Array<{ x: number; y: number; z: number }>>([]);
+  const [mapData, setMapData] = useState<MapData | null>(null);
 
   // Initialize engine
   useEffect(() => {
@@ -76,6 +78,19 @@ export function useReplay(simulationUrl: string | null) {
           console.error('useReplay: Failed to load trajectory:', trajErr);
           // Don't fail the whole load, just skip trajectory
         }
+
+        // Load map data (semantic map, drivable area, point cloud)
+        console.log('=== useReplay: Starting map data load ===');
+        try {
+          const map = await engine.loadMapData();
+          console.log('=== useReplay: loadMapData returned ===', map);
+          if (cancelled) return;
+          setMapData(map);
+          console.log('=== useReplay: Map data state updated ===');
+        } catch (mapErr) {
+          console.error('=== useReplay: Failed to load map data ===', mapErr);
+          // Don't fail the whole load, just skip map
+        }
       } catch (err) {
         // Check if effect was cleaned up during async operation
         if (cancelled) return;
@@ -128,6 +143,7 @@ export function useReplay(simulationUrl: string | null) {
     error,
     telemetry,
     fullTrajectory,
+    mapData,
     play,
     pause,
     togglePlayPause,

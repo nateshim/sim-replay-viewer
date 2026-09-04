@@ -23,6 +23,7 @@ function SimulationViewer() {
     error,
     telemetry,
     fullTrajectory,
+    mapData,
     togglePlayPause,
     seek,
     skip,
@@ -57,6 +58,14 @@ function SimulationViewer() {
       console.log(`  Last point: (${last.x.toFixed(2)}, ${last.y.toFixed(2)}, ${last.z.toFixed(2)})`);
     }
   }, [fullTrajectory]);
+
+  // Set map data when loaded
+  useEffect(() => {
+    if (sceneRef.current && mapData) {
+      console.log('Setting map data on scene...');
+      sceneRef.current.setMapData(mapData);
+    }
+  }, [mapData]);
 
   // Animation loop
   useEffect(() => {

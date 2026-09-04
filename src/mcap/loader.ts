@@ -1,7 +1,8 @@
 import { McapIndexedReader } from '@mcap/core';
 import * as lz4 from 'lz4js';
-import type { MCAPFileIndex } from './types';
+import type { MCAPFileIndex, MapData, SceneUpdate, Grid, PointCloud } from './types';
 import type { VehicleState, TelemetryPoint } from '../types';
+import { decodeProtobuf, clearProtobufCache } from './protobufDecoder';
 
 /**
  * Decompression handlers for MCAP chunks
@@ -260,6 +261,15 @@ export class MCAPLoader {
     this.schemasInfo = Array.from(this.reader.schemasById.values()).map(
       (s) => `${s.name} (encoding: ${s.encoding})`
     );
+
+    // Log all available topics and schemas for debugging
+    console.log('=== MCAP File Contents ===');
+    console.log('Schemas:', this.schemasInfo);
+    console.log('Topics:');
+    for (const [id, channel] of this.reader.channelsById) {
+      const schema = this.reader.schemasById.get(channel.schemaId);
+      console.log(`  ${channel.topic} -> ${schema?.name ?? 'unknown'} (channel ${id})`);
+    }
 
     // Calculate time range from chunk indexes
     let startTime = Number.MAX_SAFE_INTEGER;
@@ -863,9 +873,116 @@ export class MCAPLoader {
   }
 
   /**
+   * Load map data (semantic map, drivable area, point cloud)
+   * These are typically static per simulation, so we load them once
+   */
+  async loadMapData(): Promise<MapData> {
+    console.log('=== MCAPLoader.loadMapData called ===');
+
+    if (!this.reader) {
+      console.warn('loadMapData: No reader available');
+      return { semanticMap: null, drivableArea: null, pointCloud: null, markers: null };
+    }
+
+    const mapData: MapData = {
+      semanticMap: null,
+      drivableArea: null,
+      pointCloud: null,
+      markers: null,
+    };
+
+    // Find channels for map-related topics
+    const topicMap: Record<string, { channelId: number; schemaName: string; schemaData: Uint8Array }> = {};
+
+    for (const [id, channel] of this.reader.channelsById) {
+      const schema = this.reader.schemasById.get(channel.schemaId);
+      if (!schema) continue;
+
+      // We want: /semantic_map, /drivable_area, /LIDAR_TOP, /markers/annotations
+      if (['/semantic_map', '/drivable_area', '/LIDAR_TOP', '/markers/annotations'].includes(channel.topic)) {
+        topicMap[channel.topic] = {
+          channelId: id,
+          schemaName: schema.name,
+          schemaData: schema.data,
+        };
+      }
+    }
+
+    console.log('loadMapData: Found topics:', Object.keys(topicMap));
+
+    // Debug: log schema data format
+    for (const [topic, info] of Object.entries(topicMap)) {
+      const schemaPreview = new TextDecoder().decode(info.schemaData.slice(0, 100));
+      console.log(`Schema for ${topic}: first 100 chars:`, schemaPreview.slice(0, 50));
+    }
+
+    // Read one message from each topic (map data is typically static)
+    const topics = Object.keys(topicMap);
+    if (topics.length === 0) {
+      console.log('loadMapData: No map topics found');
+      return mapData;
+    }
+
+    try {
+      for await (const msg of this.reader.readMessages({ topics })) {
+        // Look up channel to get topic name
+        const channel = this.reader.channelsById.get(msg.channelId);
+        if (!channel) continue;
+
+        const topic = channel.topic;
+        const topicInfo = topicMap[topic];
+        if (!topicInfo) continue;
+
+        // Only process first message of each topic
+        if (topic === '/semantic_map' && !mapData.semanticMap) {
+          console.log('loadMapData: Decoding semantic_map...');
+          const decoded = decodeProtobuf(msg.data, topicInfo.schemaData, topicInfo.schemaName);
+          if (decoded) {
+            mapData.semanticMap = decoded as SceneUpdate;
+            console.log('loadMapData: semantic_map loaded, entities:', mapData.semanticMap.entities?.length ?? 0);
+          }
+        } else if (topic === '/drivable_area' && !mapData.drivableArea) {
+          console.log('loadMapData: Decoding drivable_area...');
+          const decoded = decodeProtobuf(msg.data, topicInfo.schemaData, topicInfo.schemaName);
+          if (decoded) {
+            mapData.drivableArea = decoded as Grid;
+            console.log('loadMapData: drivable_area loaded, size:', mapData.drivableArea.columnCount, 'x', (mapData.drivableArea.data?.length ?? 0) / (mapData.drivableArea.rowStride || 1));
+          }
+        } else if (topic === '/LIDAR_TOP' && !mapData.pointCloud) {
+          console.log('loadMapData: Decoding LIDAR_TOP...');
+          const decoded = decodeProtobuf(msg.data, topicInfo.schemaData, topicInfo.schemaName);
+          if (decoded) {
+            mapData.pointCloud = decoded as PointCloud;
+            const numPoints = (mapData.pointCloud.data?.length ?? 0) / (mapData.pointCloud.pointStride || 1);
+            console.log('loadMapData: LIDAR_TOP loaded, points:', numPoints);
+          }
+        } else if (topic === '/markers/annotations' && !mapData.markers) {
+          console.log('loadMapData: Decoding markers/annotations...');
+          const decoded = decodeProtobuf(msg.data, topicInfo.schemaData, topicInfo.schemaName);
+          if (decoded) {
+            mapData.markers = decoded as SceneUpdate;
+            console.log('loadMapData: markers loaded, entities:', mapData.markers.entities?.length ?? 0);
+          }
+        }
+
+        // Check if we have all the data we need
+        if (mapData.semanticMap && mapData.drivableArea && mapData.pointCloud && mapData.markers) {
+          break;
+        }
+      }
+    } catch (err) {
+      console.error('loadMapData: Error reading messages:', err);
+    }
+
+    console.log('loadMapData: Complete');
+    return mapData;
+  }
+
+  /**
    * Clean up resources
    */
   dispose(): void {
+    clearProtobufCache();
     // Abort all in-flight HTTP requests
     this.httpReader?.abort();
     this.httpReader = null;

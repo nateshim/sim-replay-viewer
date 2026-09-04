@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import type { VehicleState } from '../../types';
+import type { MapData, SceneEntity, Grid, PointCloud } from '../../mcap/types';
 
 /**
  * Three.js scene for simulation visualization
@@ -14,6 +15,11 @@ export class SimulationScene {
   private ground: THREE.Mesh;
   private grid: THREE.GridHelper;
   private axesHelper: THREE.AxesHelper;
+
+  // Map visualization objects
+  private mapGroup: THREE.Group | null = null;
+  private pointCloudPoints: THREE.Points | null = null;
+  private drivableAreaMesh: THREE.Mesh | null = null;
 
   // Camera follow settings - positioned behind and above the vehicle
   // After base rotation (+90° around Y), offset is transformed:
@@ -319,9 +325,303 @@ export class SimulationScene {
   }
 
   /**
+   * Set map data (semantic map, drivable area, point cloud)
+   */
+  setMapData(mapData: MapData): void {
+    console.log('SimulationScene.setMapData called');
+
+    // Clear existing map objects
+    this.clearMapObjects();
+
+    // Create a group for all map objects
+    this.mapGroup = new THREE.Group();
+    this.mapGroup.name = 'mapGroup';
+
+    // Render semantic map entities (roads, buildings, etc.)
+    if (mapData.semanticMap?.entities) {
+      console.log('Rendering semantic map with', mapData.semanticMap.entities.length, 'entities');
+      this.renderSemanticMap(mapData.semanticMap.entities);
+    }
+
+    // Render drivable area
+    if (mapData.drivableArea) {
+      console.log('Rendering drivable area');
+      this.renderDrivableArea(mapData.drivableArea);
+    }
+
+    // Render LIDAR point cloud
+    if (mapData.pointCloud) {
+      console.log('Rendering point cloud');
+      this.renderPointCloud(mapData.pointCloud);
+    }
+
+    // Render markers/annotations
+    if (mapData.markers?.entities) {
+      console.log('Rendering markers with', mapData.markers.entities.length, 'entities');
+      this.renderSemanticMap(mapData.markers.entities);
+    }
+
+    this.scene.add(this.mapGroup);
+    console.log('Map data rendering complete');
+  }
+
+  /**
+   * Clear existing map visualization objects
+   */
+  private clearMapObjects(): void {
+    if (this.mapGroup) {
+      this.scene.remove(this.mapGroup);
+      this.mapGroup.traverse((obj) => {
+        if (obj instanceof THREE.Mesh || obj instanceof THREE.Line || obj instanceof THREE.Points) {
+          obj.geometry.dispose();
+          if (Array.isArray(obj.material)) {
+            obj.material.forEach((m) => m.dispose());
+          } else if (obj.material) {
+            obj.material.dispose();
+          }
+        }
+      });
+      this.mapGroup = null;
+    }
+
+    if (this.pointCloudPoints) {
+      this.scene.remove(this.pointCloudPoints);
+      this.pointCloudPoints.geometry.dispose();
+      (this.pointCloudPoints.material as THREE.Material).dispose();
+      this.pointCloudPoints = null;
+    }
+
+    if (this.drivableAreaMesh) {
+      this.scene.remove(this.drivableAreaMesh);
+      this.drivableAreaMesh.geometry.dispose();
+      (this.drivableAreaMesh.material as THREE.Material).dispose();
+      this.drivableAreaMesh = null;
+    }
+  }
+
+  /**
+   * Render semantic map entities (SceneUpdate format)
+   */
+  private renderSemanticMap(entities: SceneEntity[]): void {
+    if (!this.mapGroup) return;
+
+    for (const entity of entities) {
+      // Render lines (roads, lane boundaries, etc.)
+      if (entity.lines && entity.lines.length > 0) {
+        for (const line of entity.lines) {
+          if (!line.points || line.points.length < 2) continue;
+
+          // Convert points to Three.js coordinates (NuScenes ENU to Three.js)
+          const points = line.points.map((p) =>
+            new THREE.Vector3(p.x, (p.z || 0) + 0.1, -p.y)
+          );
+
+          const geometry = new THREE.BufferGeometry().setFromPoints(points);
+
+          // Use line color if available, otherwise default to white
+          const color = line.color
+            ? new THREE.Color(line.color.r, line.color.g, line.color.b)
+            : new THREE.Color(0xffffff);
+
+          const material = new THREE.LineBasicMaterial({
+            color,
+            linewidth: line.thickness || 1,
+          });
+
+          const lineObj = new THREE.Line(geometry, material);
+          this.mapGroup.add(lineObj);
+        }
+      }
+
+      // Render triangles (filled polygons for roads, buildings, etc.)
+      if (entity.triangles && entity.triangles.length > 0) {
+        for (const tri of entity.triangles) {
+          if (!tri.points || tri.points.length < 3) continue;
+
+          // Convert points to Three.js coordinates
+          const vertices: number[] = [];
+          for (const p of tri.points) {
+            vertices.push(p.x, (p.z || 0) + 0.05, -p.y);
+          }
+
+          const geometry = new THREE.BufferGeometry();
+          geometry.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
+
+          // Use indices if available
+          if (tri.indices && tri.indices.length > 0) {
+            geometry.setIndex(tri.indices);
+          }
+
+          geometry.computeVertexNormals();
+
+          const color = tri.color
+            ? new THREE.Color(tri.color.r, tri.color.g, tri.color.b)
+            : new THREE.Color(0x888888);
+
+          const material = new THREE.MeshBasicMaterial({
+            color,
+            side: THREE.DoubleSide,
+            transparent: true,
+            opacity: tri.color?.a ?? 0.8,
+          });
+
+          const mesh = new THREE.Mesh(geometry, material);
+          this.mapGroup.add(mesh);
+        }
+      }
+
+      // Render cubes (obstacles, etc.)
+      if (entity.cubes && entity.cubes.length > 0) {
+        for (const cube of entity.cubes) {
+          const geometry = new THREE.BoxGeometry(
+            cube.size.x,
+            cube.size.z || 1,
+            cube.size.y
+          );
+
+          const color = cube.color
+            ? new THREE.Color(cube.color.r, cube.color.g, cube.color.b)
+            : new THREE.Color(0xff0000);
+
+          const material = new THREE.MeshBasicMaterial({
+            color,
+            transparent: true,
+            opacity: cube.color?.a ?? 0.8,
+          });
+
+          const mesh = new THREE.Mesh(geometry, material);
+
+          // Position (convert NuScenes to Three.js)
+          if (cube.pose?.position) {
+            mesh.position.set(
+              cube.pose.position.x,
+              (cube.pose.position.z || 0) + (cube.size.z || 1) / 2,
+              -cube.pose.position.y
+            );
+          }
+
+          this.mapGroup.add(mesh);
+        }
+      }
+    }
+  }
+
+  /**
+   * Render drivable area from Grid data
+   */
+  private renderDrivableArea(grid: Grid): void {
+    if (!this.mapGroup || !grid.data || grid.data.length === 0) return;
+
+    // Debug: log grid structure
+    console.log('Grid data structure:', Object.keys(grid));
+    console.log('Grid:', {
+      columnCount: grid.columnCount,
+      rowStride: grid.rowStride,
+      cellStride: grid.cellStride,
+      cellSize: grid.cellSize,
+      dataLength: grid.data?.length,
+    });
+
+    const columnCount = grid.columnCount || 100;
+    const rowStride = grid.rowStride || 1;
+    const rowCount = Math.floor(grid.data.length / rowStride);
+    const cellSizeX = grid.cellSize?.x || 1;
+    const cellSizeY = grid.cellSize?.y || 1;
+
+    console.log(`Drivable area: ${columnCount}x${rowCount} cells, cell size: ${cellSizeX}x${cellSizeY}`);
+
+    // Create a plane geometry for the drivable area
+    const width = columnCount * cellSizeX;
+    const height = rowCount * cellSizeY;
+
+    const geometry = new THREE.PlaneGeometry(width, height, columnCount - 1, rowCount - 1);
+    geometry.rotateX(-Math.PI / 2); // Lay flat
+
+    // Apply grid position (convert NuScenes to Three.js)
+    const posX = grid.pose?.position?.x ?? 0;
+    const posY = grid.pose?.position?.y ?? 0;
+    const posZ = grid.pose?.position?.z ?? 0;
+
+    const material = new THREE.MeshBasicMaterial({
+      color: 0x4a7c4a, // Green tint for drivable area
+      transparent: true,
+      opacity: 0.3,
+      side: THREE.DoubleSide,
+    });
+
+    this.drivableAreaMesh = new THREE.Mesh(geometry, material);
+    this.drivableAreaMesh.position.set(
+      posX + width / 2,
+      posZ + 0.02, // Slightly above ground
+      -(posY + height / 2)
+    );
+
+    this.mapGroup.add(this.drivableAreaMesh);
+  }
+
+  /**
+   * Render LIDAR point cloud
+   */
+  private renderPointCloud(pointCloud: PointCloud): void {
+    if (!this.mapGroup || !pointCloud.data || pointCloud.data.length === 0) return;
+
+    const pointStride = pointCloud.pointStride || 12; // Default: 3 floats (x, y, z)
+    const numPoints = Math.floor(pointCloud.data.length / pointStride);
+
+    console.log(`Point cloud: ${numPoints} points, stride: ${pointStride}`);
+
+    // Find x, y, z field offsets
+    let xOffset = 0, yOffset = 4, zOffset = 8;
+    for (const field of pointCloud.fields || []) {
+      if (field.name === 'x') xOffset = field.offset;
+      else if (field.name === 'y') yOffset = field.offset;
+      else if (field.name === 'z') zOffset = field.offset;
+    }
+
+    // Extract points from binary data
+    const positions = new Float32Array(numPoints * 3);
+    const dataView = new DataView(pointCloud.data.buffer, pointCloud.data.byteOffset, pointCloud.data.byteLength);
+
+    for (let i = 0; i < numPoints; i++) {
+      const offset = i * pointStride;
+      const x = dataView.getFloat32(offset + xOffset, true);
+      const y = dataView.getFloat32(offset + yOffset, true);
+      const z = dataView.getFloat32(offset + zOffset, true);
+
+      // Convert NuScenes to Three.js coordinates
+      positions[i * 3] = x;
+      positions[i * 3 + 1] = z;
+      positions[i * 3 + 2] = -y;
+    }
+
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+
+    const material = new THREE.PointsMaterial({
+      color: 0xffff00,
+      size: 0.2,
+      sizeAttenuation: true,
+    });
+
+    this.pointCloudPoints = new THREE.Points(geometry, material);
+
+    // Apply point cloud pose (convert NuScenes to Three.js)
+    if (pointCloud.pose?.position) {
+      this.pointCloudPoints.position.set(
+        pointCloud.pose.position.x,
+        pointCloud.pose.position.z || 0,
+        -pointCloud.pose.position.y
+      );
+    }
+
+    this.mapGroup.add(this.pointCloudPoints);
+  }
+
+  /**
    * Clean up resources
    */
   dispose(): void {
+    this.clearMapObjects();
     window.removeEventListener('resize', this.handleResize);
 
     // Dispose of Three.js objects
