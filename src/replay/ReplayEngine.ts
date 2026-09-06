@@ -15,12 +15,16 @@ export class ReplayEngine {
   private state: ReplayState;
   private lastUpdateTime: number = 0;
   private lastStateEmitTime: number = 0;
+  private lastPrefetchTime: number = 0;
   private animationFrameId: number | null = null;
   private eventListeners: Map<ReplayEventType, Set<ReplayEventCallback>> = new Map();
-  private prefetchScheduled: boolean = false;
+  private isPrefetching: boolean = false;
+  private isLoadingCurrentTime: boolean = false;
 
   // Throttle React state updates to ~10 per second
   private readonly STATE_EMIT_INTERVAL = 100;
+  // Throttle prefetch to once per second
+  private readonly PREFETCH_INTERVAL = 1000;
 
   constructor() {
     this.state = {
@@ -280,22 +284,37 @@ export class ReplayEngine {
         return;
       }
 
-      // Check if we need to load data for current time
-      if (this.loader && !this.loader.hasDataForTime(newTime)) {
-        // Pause briefly while loading
-        this.loader.loadTimeRange(newTime).catch((err) => {
-          console.warn('Failed to load data during playback:', err);
-        });
+      // Check if we need to load data for current time (with lock to prevent duplicate requests)
+      if (this.loader && !this.loader.hasDataForTime(newTime) && !this.isLoadingCurrentTime) {
+        console.log(`[Playback] Loading chunk for time ${newTime.toFixed(2)}s...`);
+        this.isLoadingCurrentTime = true;
+        this.loader.loadTimeRange(newTime)
+          .then(() => {
+            console.log(`[Playback] Chunk loaded for time ${newTime.toFixed(2)}s`);
+          })
+          .catch((err) => {
+            console.warn('Failed to load data during playback:', err);
+          })
+          .finally(() => {
+            this.isLoadingCurrentTime = false;
+          });
       }
 
-      // Schedule prefetch for upcoming data (don't block current frame)
-      if (!this.prefetchScheduled && this.loader) {
-        this.prefetchScheduled = true;
-        // Use setTimeout to avoid blocking the animation frame
-        setTimeout(() => {
-          this.loader?.prefetchRange(this.state.currentTime, this.state.playbackRate);
-          this.prefetchScheduled = false;
-        }, 0);
+      // Schedule prefetch for upcoming data (throttled to prevent request storms)
+      const shouldPrefetch = this.loader &&
+        !this.isPrefetching &&
+        (now - this.lastPrefetchTime) >= this.PREFETCH_INTERVAL;
+
+      if (shouldPrefetch) {
+        this.lastPrefetchTime = now;
+        this.isPrefetching = true;
+        this.loader!.prefetchRange(this.state.currentTime, this.state.playbackRate)
+          .catch((err) => {
+            console.warn('Prefetch failed:', err);
+          })
+          .finally(() => {
+            this.isPrefetching = false;
+          });
       }
 
       this.updateState({ currentTime: newTime });

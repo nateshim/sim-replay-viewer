@@ -15,13 +15,16 @@ const decompressHandlers = {
 
 /**
  * Custom IReadable implementation for HTTP range requests
- * Supports aborting in-flight requests when disposed
+ * Uses a simple sequential approach to prevent browser resource exhaustion
  */
 class HttpRangeReader {
   private url: string;
   private fileSize: number | null = null;
   private abortController: AbortController;
   private isAborted: boolean = false;
+
+  // Sequential request handling - only one request at a time
+  private pendingRequest: Promise<Uint8Array> | null = null;
 
   constructor(url: string) {
     this.url = url;
@@ -47,6 +50,26 @@ class HttpRangeReader {
     if (this.isAborted) {
       throw new Error('Reader has been aborted');
     }
+
+    // Wait for any pending request to complete before starting a new one
+    // This serializes requests to prevent overwhelming the browser
+    if (this.pendingRequest) {
+      try {
+        await this.pendingRequest;
+      } catch {
+        // Ignore errors from previous request
+      }
+    }
+
+    const request = this.executeRead(offset, length);
+    this.pendingRequest = request;
+    return request;
+  }
+
+  /**
+   * Execute an HTTP range request
+   */
+  private async executeRead(offset: bigint, length: bigint): Promise<Uint8Array> {
     const start = Number(offset);
     const end = Number(offset + length) - 1;
 
@@ -108,12 +131,16 @@ class RangeCache {
    * Add a new range, evicting oldest if necessary
    */
   addRange(range: LoadedRange): void {
+    console.log(`[RangeCache] Adding range ${range.startTime.toFixed(2)}-${range.endTime.toFixed(2)}s with ${range.states.length} states`);
+
     // Check if this range overlaps with existing - merge if so
     const overlapping = this.ranges.filter(
       (r) => !(range.endTime < r.startTime || range.startTime > r.endTime)
     );
 
     if (overlapping.length > 0) {
+      console.log(`[RangeCache] Merging with ${overlapping.length} existing range(s)`);
+
       // Remove overlapping ranges
       this.ranges = this.ranges.filter(
         (r) => range.endTime < r.startTime || range.startTime > r.endTime
@@ -139,13 +166,21 @@ class RangeCache {
         telemetry: this.dedupeByTimestamp(allTelemetry),
       };
 
+      console.log(`[RangeCache] Merged range: ${mergedRange.startTime.toFixed(2)}-${mergedRange.endTime.toFixed(2)}s with ${mergedRange.states.length} states`);
       this.ranges.push(mergedRange);
     } else {
       // Evict oldest if at capacity
       if (this.ranges.length >= this.maxRanges) {
+        console.log(`[RangeCache] Evicting oldest range`);
         this.ranges.shift();
       }
       this.ranges.push(range);
+    }
+
+    // Log current cache state
+    console.log(`[RangeCache] Now have ${this.ranges.length} range(s):`);
+    for (const r of this.ranges) {
+      console.log(`  ${r.startTime.toFixed(2)}-${r.endTime.toFixed(2)}s: ${r.states.length} states`);
     }
   }
 
@@ -324,6 +359,7 @@ export class MCAPLoader {
 
     // Check if already loaded (using relative time for cache)
     if (this.rangeCache.hasTimestamp(targetTime)) {
+      console.log(`[loadTimeRange] t=${targetTime.toFixed(2)}s already in cache, skipping`);
       return;
     }
 
@@ -331,8 +367,11 @@ export class MCAPLoader {
     const rangeKey = `${rangeStart.toFixed(2)}-${rangeEnd.toFixed(2)}`;
     const existingLoad = this.loadingRanges.get(rangeKey);
     if (existingLoad) {
+      console.log(`[loadTimeRange] t=${targetTime.toFixed(2)}s already loading (range ${rangeKey}), waiting...`);
       return existingLoad;
     }
+
+    console.log(`[loadTimeRange] Starting load for t=${targetTime.toFixed(2)}s (range ${rangeKey})`);
 
     // Start loading
     const loadPromise = this.doLoadRange(rangeStart, rangeEnd);
@@ -340,6 +379,7 @@ export class MCAPLoader {
 
     try {
       await loadPromise;
+      console.log(`[loadTimeRange] Completed load for t=${targetTime.toFixed(2)}s`);
     } finally {
       this.loadingRanges.delete(rangeKey);
     }
@@ -358,6 +398,8 @@ export class MCAPLoader {
 
     // Base time for converting absolute to relative timestamps
     const baseTime = this.index.startTime;
+
+    console.log(`[doLoadRange] Loading absolute time ${startTime.toFixed(2)} - ${endTime.toFixed(2)} (relative: ${(startTime - baseTime).toFixed(2)} - ${(endTime - baseTime).toFixed(2)})`);
 
     const states: VehicleState[] = [];
     const telemetry: TelemetryPoint[] = [];
@@ -437,8 +479,13 @@ export class MCAPLoader {
 
     // Log loading results for debugging (show relative times)
     console.log(
-      `Loaded range ${relativeStartTime.toFixed(2)}-${relativeEndTime.toFixed(2)}s: ${states.length} vehicle states`
+      `=== Loaded chunk ${relativeStartTime.toFixed(2)}-${relativeEndTime.toFixed(2)}s: ${states.length} vehicle states ===`
     );
+    if (states.length > 0) {
+      const first = states[0];
+      const last = states[states.length - 1];
+      console.log(`  Chunk positions: (${first.position.x.toFixed(2)}, ${first.position.y.toFixed(2)}) -> (${last.position.x.toFixed(2)}, ${last.position.y.toFixed(2)})`);
+    }
 
     // Log if no data was parsed (for debugging)
     if (states.length === 0) {
@@ -460,11 +507,11 @@ export class MCAPLoader {
     const prefetchAhead = this.chunkDuration * Math.max(1, playbackRate);
     const prefetchTime = currentTime + prefetchAhead;
 
-    if (prefetchTime <= this.index.endTime && !this.rangeCache.hasTimestamp(prefetchTime)) {
-      // Don't await - let it load in background
-      this.loadTimeRange(prefetchTime).catch((err) => {
-        console.warn('Prefetch failed:', err);
-      });
+    // Also clamp to duration
+    const clampedPrefetchTime = Math.min(prefetchTime, this.index.duration);
+
+    if (clampedPrefetchTime > currentTime && !this.rangeCache.hasTimestamp(clampedPrefetchTime)) {
+      await this.loadTimeRange(clampedPrefetchTime);
     }
   }
 
@@ -474,10 +521,16 @@ export class MCAPLoader {
   private parseVehicleState(
     data: Uint8Array,
     timestamp: number,
-    _topic: string,
+    topic: string,
     encoding: string,
     schemaName: string
   ): { state: VehicleState | null; error?: string } {
+    // Prefer /pose topic (foxglove.PoseInFrame) over /odom for vehicle position
+    // /odom often contains odometry data that may drift or be nearly stationary
+    // /pose typically contains the actual vehicle position
+    const isPoseInFrame = schemaName === 'foxglove.PoseInFrame' || schemaName === 'PoseInFrame';
+    const isOdom = topic === '/odom' && schemaName === 'Pose';
+
     // Only process pose-related schemas
     const poseSchemas = ['Pose', 'PoseInFrame', 'foxglove.PoseInFrame', 'geometry_msgs/Pose', 'nav_msgs/Odometry'];
     const isPoseSchema = poseSchemas.some(s => schemaName.includes(s) || schemaName === s);
@@ -486,8 +539,49 @@ export class MCAPLoader {
       return { state: null }; // Skip non-pose messages silently
     }
 
-    // For protobuf encoding, we can't parse without the schema definition
+    // Skip /odom if we have /pose available (foxglove.PoseInFrame)
+    // We'll check this by preferring PoseInFrame when available
+    if (isOdom && !isPoseInFrame) {
+      // Still process /odom but with lower priority - the caller will need to handle dedup
+      // For now, let's try to decode PoseInFrame messages first
+    }
+
+    // For protobuf encoding, we need to decode using the schema
     if (encoding === 'protobuf') {
+      // Try to decode PoseInFrame protobuf messages
+      if (isPoseInFrame) {
+        const schema = this.reader?.schemasById.get(
+          Array.from(this.reader?.channelsById.values() || [])
+            .find(ch => ch.topic === topic)?.schemaId || 0
+        );
+        if (schema) {
+          try {
+            const decoded = decodeProtobuf(data, schema.data, schemaName);
+            if (decoded && typeof decoded === 'object') {
+              const poseInFrame = decoded as { pose?: { position?: { x: number; y: number; z: number }; orientation?: { x: number; y: number; z: number; w: number } } };
+              if (poseInFrame.pose?.position) {
+                return {
+                  state: {
+                    timestamp,
+                    position: {
+                      x: poseInFrame.pose.position.x ?? 0,
+                      y: poseInFrame.pose.position.y ?? 0,
+                      z: poseInFrame.pose.position.z ?? 0,
+                    },
+                    rotation: poseInFrame.pose.orientation ?? { x: 0, y: 0, z: 0, w: 1 },
+                    speed: 0,
+                    acceleration: 0,
+                    yawRate: 0,
+                    jerk: 0,
+                  },
+                };
+              }
+            }
+          } catch (err) {
+            console.warn(`Failed to decode PoseInFrame:`, err);
+          }
+        }
+      }
       return {
         state: null,
         error: `Schema "${schemaName}": protobuf encoding requires schema definition`,
@@ -500,11 +594,13 @@ export class MCAPLoader {
       const jsonStr = decoder.decode(data);
       const parsed = JSON.parse(jsonStr);
 
-      // Debug: log first message of each schema type
-      if (!this.loggedSchemas.has(schemaName)) {
-        this.loggedSchemas.add(schemaName);
-        console.log(`Sample ${schemaName} message - ALL FIELDS:`, Object.keys(parsed));
-        console.log(`Full message:`, JSON.stringify(parsed, null, 2).slice(0, 1500));
+      // Debug: log first message of each topic/schema combination
+      const topicSchemaKey = `parsed_${topic}_${schemaName}`;
+      if (!this.loggedSchemas.has(topicSchemaKey)) {
+        this.loggedSchemas.add(topicSchemaKey);
+        console.log(`[parseVehicleState] Topic: ${topic}, Schema: ${schemaName}`);
+        console.log(`  ALL FIELDS:`, Object.keys(parsed));
+        console.log(`  Full message:`, JSON.stringify(parsed, null, 2).slice(0, 1500));
       }
 
       // Try various pose data structures
@@ -638,7 +734,40 @@ export class MCAPLoader {
    */
   getStateAtTime(timestamp: number): VehicleState | null {
     const states = this.rangeCache.getAllStates();
-    if (states.length === 0) return null;
+    if (states.length === 0) {
+      // Log occasionally when no states available
+      if (!this.loggedSchemas.has(`no_states_${Math.floor(timestamp)}`)) {
+        this.loggedSchemas.add(`no_states_${Math.floor(timestamp)}`);
+        console.warn(`getStateAtTime(${timestamp.toFixed(2)}): No states in cache!`);
+      }
+      return null;
+    }
+
+    // Debug: log state range periodically to track chunk loading progress
+    const debugKey = `state_range_${Math.floor(timestamp / 3)}`; // Log every 3 seconds
+    if (!this.loggedSchemas.has(debugKey)) {
+      this.loggedSchemas.add(debugKey);
+      const first = states[0];
+      const last = states[states.length - 1];
+      console.log(`=== getStateAtTime(${timestamp.toFixed(2)}) ===`);
+      console.log(`  States in cache: ${states.length}`);
+      console.log(`  Cache time range: ${first.timestamp.toFixed(2)}s - ${last.timestamp.toFixed(2)}s`);
+      console.log(`  First pos: (${first.position.x.toFixed(2)}, ${first.position.y.toFixed(2)}, ${first.position.z.toFixed(2)})`);
+      console.log(`  Last pos: (${last.position.x.toFixed(2)}, ${last.position.y.toFixed(2)}, ${last.position.z.toFixed(2)})`);
+
+      // Check if positions actually change
+      const posChange = {
+        x: last.position.x - first.position.x,
+        y: last.position.y - first.position.y,
+        z: last.position.z - first.position.z,
+      };
+      console.log(`  Position change: (${posChange.x.toFixed(2)}, ${posChange.y.toFixed(2)}, ${posChange.z.toFixed(2)})`);
+
+      // Check if timestamp is within range
+      if (timestamp < first.timestamp || timestamp > last.timestamp) {
+        console.warn(`  WARNING: Requested time ${timestamp.toFixed(2)} is OUTSIDE cache range!`);
+      }
+    }
 
     // Binary search for closest state
     let low = 0;
@@ -654,8 +783,22 @@ export class MCAPLoader {
     }
 
     // Handle edge cases
-    if (low === 0) return states[0];
-    if (low >= states.length) return states[states.length - 1];
+    if (low === 0) {
+      // Requested time is before first state
+      const state = states[0];
+      if (timestamp < state.timestamp - 0.5) {
+        console.warn(`[getStateAtTime] Requested t=${timestamp.toFixed(2)}s but earliest state is at ${state.timestamp.toFixed(2)}s`);
+      }
+      return state;
+    }
+    if (low >= states.length) {
+      // Requested time is after last state - THIS IS THE PROBLEM CASE
+      const state = states[states.length - 1];
+      if (timestamp > state.timestamp + 0.5) {
+        console.warn(`[getStateAtTime] Requested t=${timestamp.toFixed(2)}s but latest state is at ${state.timestamp.toFixed(2)}s - NEED TO LOAD MORE DATA`);
+      }
+      return state;
+    }
 
     // Interpolate between two closest states
     const before = states[low - 1];
@@ -770,19 +913,39 @@ export class MCAPLoader {
       return [];
     }
 
-    // Find the Pose topic/channel to filter messages
+    // Find pose topics - prefer foxglove.PoseInFrame over Pose
+    // /pose (PoseInFrame) typically has the actual vehicle position
+    // /odom (Pose) often has odometry data that may be stationary
     let poseTopics: string[] = [];
+    let poseInFrameTopics: string[] = [];
+
     for (const [, channel] of this.reader.channelsById) {
       const schema = this.reader.schemasById.get(channel.schemaId);
-      if (schema?.name === 'Pose') {
+      if (schema?.name === 'foxglove.PoseInFrame' || schema?.name === 'PoseInFrame') {
+        poseInFrameTopics.push(channel.topic);
+      } else if (schema?.name === 'Pose') {
         poseTopics.push(channel.topic);
       }
     }
 
-    console.log('loadFullTrajectory: Pose topics:', poseTopics);
+    console.log('loadFullTrajectory: PoseInFrame topics found:', poseInFrameTopics);
+    console.log('loadFullTrajectory: Pose topics found:', poseTopics);
 
-    if (poseTopics.length === 0) {
-      console.log('loadFullTrajectory: No Pose topics found');
+    // Prefer PoseInFrame topics if available
+    const topicsToUse = poseInFrameTopics.length > 0 ? poseInFrameTopics : poseTopics;
+    const usePoseInFrame = poseInFrameTopics.length > 0;
+
+    console.log('loadFullTrajectory: Using topics:', topicsToUse, usePoseInFrame ? '(PoseInFrame)' : '(Pose)');
+
+    // Also log ALL channels and their schemas for debugging
+    console.log('loadFullTrajectory: All channels:');
+    for (const [id, channel] of this.reader.channelsById) {
+      const schema = this.reader.schemasById.get(channel.schemaId);
+      console.log(`  Channel ${id}: ${channel.topic} -> schema: ${schema?.name}`);
+    }
+
+    if (topicsToUse.length === 0) {
+      console.log('loadFullTrajectory: No pose topics found');
       return [];
     }
 
@@ -798,8 +961,8 @@ export class MCAPLoader {
     let messageCount = 0;
 
     try {
-      // Read only Pose messages by filtering topics
-      for await (const msg of this.reader.readMessages({ topics: poseTopics })) {
+      // Read pose messages by filtering topics
+      for await (const msg of this.reader.readMessages({ topics: topicsToUse })) {
         messageCount++;
 
         // Log first message to confirm iteration is working
@@ -813,20 +976,45 @@ export class MCAPLoader {
         }
 
         try {
-          const decoder = new TextDecoder();
-          const jsonStr = decoder.decode(msg.data);
-          const parsed = JSON.parse(jsonStr);
+          let x = 0, y = 0, z = 0;
+          let foundPosition = false;
 
-          if (parsed.pos) {
+          if (usePoseInFrame) {
+            // Decode PoseInFrame protobuf message
+            const channel = this.reader.channelsById.get(msg.channelId);
+            const schema = channel ? this.reader.schemasById.get(channel.schemaId) : null;
+            if (schema) {
+              const decoded = decodeProtobuf(msg.data, schema.data, schema.name);
+              if (decoded && typeof decoded === 'object') {
+                const poseInFrame = decoded as { pose?: { position?: { x: number; y: number; z: number } } };
+                if (poseInFrame.pose?.position) {
+                  x = poseInFrame.pose.position.x ?? 0;
+                  y = poseInFrame.pose.position.y ?? 0;
+                  z = poseInFrame.pose.position.z ?? 0;
+                  foundPosition = true;
+                }
+              }
+            }
+          } else {
+            // Parse JSON Pose message
+            const decoder = new TextDecoder();
+            const jsonStr = decoder.decode(msg.data);
+            const parsed = JSON.parse(jsonStr);
+
+            if (parsed.pos) {
+              x = Number(parsed.pos.x) || 0;
+              y = Number(parsed.pos.y) || 0;
+              z = Number(parsed.pos.z) || 0;
+              foundPosition = true;
+            }
+          }
+
+          if (foundPosition) {
             const timestamp = Number(msg.logTime) / 1e9 - baseTime;
 
             // Skip if too close to last point (downsample for performance)
             if (timestamp - lastTimestamp < minInterval) continue;
             lastTimestamp = timestamp;
-
-            const x = Number(parsed.pos.x) || 0;
-            const y = Number(parsed.pos.y) || 0;
-            const z = Number(parsed.pos.z) || 0;
 
             positions.push({ x, y, z, timestamp });
 
@@ -855,6 +1043,21 @@ export class MCAPLoader {
 
     // Sort by timestamp and return just positions
     positions.sort((a, b) => a.timestamp - b.timestamp);
+
+    // Debug: compare first and last positions to verify movement
+    if (positions.length >= 2) {
+      const first = positions[0];
+      const last = positions[positions.length - 1];
+      const dist = Math.sqrt(
+        Math.pow(last.x - first.x, 2) +
+        Math.pow(last.y - first.y, 2) +
+        Math.pow(last.z - first.z, 2)
+      );
+      console.log(`loadFullTrajectory: Total distance traveled: ${dist.toFixed(2)}m`);
+      console.log(`  First pos: (${first.x.toFixed(2)}, ${first.y.toFixed(2)}, ${first.z.toFixed(2)}) at t=${first.timestamp.toFixed(2)}s`);
+      console.log(`  Last pos: (${last.x.toFixed(2)}, ${last.y.toFixed(2)}, ${last.z.toFixed(2)}) at t=${last.timestamp.toFixed(2)}s`);
+    }
+
     return positions.map(p => ({ x: p.x, y: p.y, z: p.z }));
   }
 
@@ -909,12 +1112,6 @@ export class MCAPLoader {
     }
 
     console.log('loadMapData: Found topics:', Object.keys(topicMap));
-
-    // Debug: log schema data format
-    for (const [topic, info] of Object.entries(topicMap)) {
-      const schemaPreview = new TextDecoder().decode(info.schemaData.slice(0, 100));
-      console.log(`Schema for ${topic}: first 100 chars:`, schemaPreview.slice(0, 50));
-    }
 
     // Read one message from each topic (map data is typically static)
     const topics = Object.keys(topicMap);

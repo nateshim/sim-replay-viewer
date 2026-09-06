@@ -188,11 +188,17 @@ export class SimulationScene {
     return group;
   }
 
+  // Store raw trajectory for comparison
+  private rawTrajectoryPositions: Array<{ x: number; y: number; z: number }> = [];
+
   /**
    * Update trajectory visualization
    * Uses same coordinate conversion as vehicle position
    */
   setTrajectory(positions: Array<{ x: number; y: number; z: number }>): void {
+    // Store raw positions for comparison
+    this.rawTrajectoryPositions = positions;
+
     // Remove existing trajectory
     if (this.trajectory) {
       this.scene.remove(this.trajectory);
@@ -210,10 +216,17 @@ export class SimulationScene {
     // Slightly above ground (0.5) to be clearly visible
     const points = positions.map((p) => new THREE.Vector3(p.x, (p.z || 0) + 0.5, -p.y));
 
+    // Debug: log RAW coordinates (before conversion)
+    const firstRaw = positions[0];
+    const lastRaw = positions[positions.length - 1];
+    console.log(`Trajectory RAW: ${positions.length} points`);
+    console.log(`  First RAW (NuScenes): (${firstRaw.x.toFixed(2)}, ${firstRaw.y.toFixed(2)}, ${firstRaw.z.toFixed(2)})`);
+    console.log(`  Last RAW (NuScenes): (${lastRaw.x.toFixed(2)}, ${lastRaw.y.toFixed(2)}, ${lastRaw.z.toFixed(2)})`);
+
     // Debug: log converted coordinates
     const first = points[0];
     const last = points[points.length - 1];
-    console.log(`Trajectory: ${points.length} points`);
+    console.log(`Trajectory CONVERTED (Three.js): ${points.length} points`);
     console.log(`  First Three.js: (${first.x.toFixed(2)}, ${first.y.toFixed(2)}, ${first.z.toFixed(2)})`);
     console.log(`  Last Three.js: (${last.x.toFixed(2)}, ${last.y.toFixed(2)}, ${last.z.toFixed(2)})`);
 
@@ -233,6 +246,16 @@ export class SimulationScene {
   }
 
   /**
+   * Get trajectory positions for comparison
+   */
+  getTrajectoryPositions(): Array<{ x: number; y: number; z: number }> {
+    return this.rawTrajectoryPositions;
+  }
+
+  // Debug: track last logged time for comparison
+  private lastComparisonLogTime: number = 0;
+
+  /**
    * Update vehicle state (called every frame)
    * NuScenes uses ENU: X=East, Y=North, Z=Up
    * Three.js uses: X=Right, Y=Up, Z=Towards viewer
@@ -250,6 +273,33 @@ export class SimulationScene {
       -state.position.y
     );
     this.vehicle.position.copy(this.tempPosition);
+
+    // Debug: compare vehicle position with trajectory periodically
+    const now = performance.now();
+    if (now - this.lastComparisonLogTime > 3000 && this.rawTrajectoryPositions.length > 0) {
+      this.lastComparisonLogTime = now;
+
+      // Find nearest trajectory point by time (assume trajectory is at regular intervals)
+      const trajectoryDuration = 17; // Approximate, from summary
+      const trajIndex = Math.min(
+        Math.floor((state.timestamp / trajectoryDuration) * this.rawTrajectoryPositions.length),
+        this.rawTrajectoryPositions.length - 1
+      );
+      const nearestTrajPoint = this.rawTrajectoryPositions[trajIndex];
+
+      if (nearestTrajPoint) {
+        const distance = Math.sqrt(
+          Math.pow(state.position.x - nearestTrajPoint.x, 2) +
+          Math.pow(state.position.y - nearestTrajPoint.y, 2) +
+          Math.pow(state.position.z - nearestTrajPoint.z, 2)
+        );
+
+        console.log(`[Vehicle vs Trajectory] t=${state.timestamp.toFixed(2)}s`);
+        console.log(`  Vehicle RAW pos: (${state.position.x.toFixed(2)}, ${state.position.y.toFixed(2)}, ${state.position.z.toFixed(2)})`);
+        console.log(`  Trajectory[${trajIndex}] RAW: (${nearestTrajPoint.x.toFixed(2)}, ${nearestTrajPoint.y.toFixed(2)}, ${nearestTrajPoint.z.toFixed(2)})`);
+        console.log(`  Distance: ${distance.toFixed(2)}m`);
+      }
+    }
 
     // Convert quaternion from NuScenes to Three.js
     // NuScenes: rotation around Z-axis (up) for yaw
