@@ -111,14 +111,18 @@ export class ReplayEngine {
 
   /**
    * Load trajectory and map data in background without blocking
+   * NOTE: We must serialize these operations because the MCAP reader
+   * doesn't support concurrent message iteration
    */
   private async startBackgroundLoading(loader: MCAPLoader): Promise<void> {
     console.log('[ReplayEngine] Starting background loading...');
-    // Load map data in background (don't await)
-    this.loadMapDataInBackground(loader);
 
-    // Proactively load next chunks
-    this.proactivelyLoadChunks(loader);
+    // First proactively load chunks (higher priority for playback)
+    // This needs to complete before map data to avoid reader conflicts
+    await this.proactivelyLoadChunks(loader);
+
+    // Then load map data (lower priority, static data)
+    this.loadMapDataInBackground(loader);
   }
 
   /**
