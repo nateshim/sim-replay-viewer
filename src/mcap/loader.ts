@@ -698,16 +698,6 @@ export class MCAPLoader {
         };
       }
 
-      // Debug: log parsed positions to compare with trajectory
-      if (!this.loggedSchemas.has(`${schemaName}_parsed`)) {
-        this.loggedSchemas.add(`${schemaName}_parsed`);
-        console.log(`Successfully parsed ${schemaName}: pos=(${position.x.toFixed(2)}, ${position.y.toFixed(2)}), timestamp=${timestamp.toFixed(2)}`);
-      }
-      // Log a few more positions to see if they change
-      if (timestamp < 1.0 || (timestamp > 5.0 && timestamp < 5.5)) {
-        console.log(`Vehicle pos at t=${timestamp.toFixed(2)}: (${position.x.toFixed(2)}, ${position.y.toFixed(2)})`);
-      }
-
       // Use parsed values or fallbacks
       return {
         state: {

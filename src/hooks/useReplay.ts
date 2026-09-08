@@ -5,6 +5,8 @@ import { ReplayEngine } from '../replay/ReplayEngine';
 
 /**
  * Hook for managing replay state and engine
+ * Uses progressive loading - renders immediately after first chunk,
+ * loads trajectory and map data in background
  */
 export function useReplay(simulationUrl: string | null) {
   const engineRef = useRef<ReplayEngine | null>(null);
@@ -39,6 +41,16 @@ export function useReplay(simulationUrl: string | null) {
       setTelemetry(engine.getTelemetry());
     });
 
+    // Subscribe to trajectory updates (progressive loading)
+    engine.on('trajectoryUpdate', (trajectory) => {
+      setFullTrajectory(trajectory as Array<{ x: number; y: number; z: number }>);
+    });
+
+    // Subscribe to map data updates (background loading)
+    engine.on('mapDataUpdate', (map) => {
+      setMapData(map as MapData);
+    });
+
     return () => {
       engineRef.current = null;
       engine.dispose();
@@ -55,46 +67,28 @@ export function useReplay(simulationUrl: string | null) {
     const loadSim = async () => {
       try {
         setError(null);
+        // Reset state for new simulation
+        setFullTrajectory([]);
+        setMapData(null);
+        setTelemetry([]);
+
+        // Load simulation - this now returns after first chunk is ready
+        // Trajectory and map data load in background
         await engine.loadSimulation(simulationUrl);
 
-        // Check if effect was cleaned up during async operation
         if (cancelled) return;
 
+        // Get initial telemetry from first chunk
         setTelemetry(engine.getTelemetry());
 
-        // Load full trajectory for visualization (don't block on errors)
-        console.log('useReplay: Loading full trajectory...');
-        try {
-          const trajectory = await engine.loadFullTrajectory();
-          console.log('useReplay: Got trajectory with', trajectory.length, 'points');
-          if (cancelled) return;
-          if (trajectory.length > 0) {
-            setFullTrajectory(trajectory);
-            console.log('useReplay: Trajectory state updated');
-          } else {
-            console.warn('useReplay: Trajectory is empty');
-          }
-        } catch (trajErr) {
-          console.error('useReplay: Failed to load trajectory:', trajErr);
-          // Don't fail the whole load, just skip trajectory
+        // Get initial trajectory from first chunk (progressive)
+        const initialTrajectory = engine.getTrajectory();
+        if (initialTrajectory.length > 0) {
+          setFullTrajectory(initialTrajectory);
         }
 
-        // Load map data (semantic map, drivable area, point cloud)
-        console.log('=== useReplay: Starting map data load ===');
-        try {
-          const map = await engine.loadMapData();
-          console.log('=== useReplay: loadMapData returned ===', map);
-          if (cancelled) return;
-          setMapData(map);
-          console.log('=== useReplay: Map data state updated ===');
-        } catch (mapErr) {
-          console.error('=== useReplay: Failed to load map data ===', mapErr);
-          // Don't fail the whole load, just skip map
-        }
       } catch (err) {
-        // Check if effect was cleaned up during async operation
         if (cancelled) return;
-
         setError(err instanceof Error ? err.message : 'Failed to load simulation');
       }
     };

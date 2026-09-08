@@ -2,13 +2,22 @@ import type { ReplayState, VehicleState, TelemetryPoint } from '../types';
 import type { MapData } from '../mcap/types';
 import { MCAPLoader } from '../mcap/loader';
 
-export type ReplayEventType = 'stateChange' | 'timeUpdate' | 'loaded' | 'error' | 'dataLoading';
+export type ReplayEventType =
+  | 'stateChange'
+  | 'timeUpdate'
+  | 'loaded'
+  | 'error'
+  | 'dataLoading'
+  | 'trajectoryUpdate'
+  | 'mapDataUpdate'
+  | 'chunkLoaded';
+
 export type ReplayEventCallback = (data: unknown) => void;
 
 /**
  * Core replay engine that manages simulation playback
  * Separates simulation time from render time per AGENTS.md
- * Uses chunked loading - only loads data as needed
+ * Uses progressive chunked loading for fast initial render
  */
 export class ReplayEngine {
   private loader: MCAPLoader | null = null;
@@ -20,11 +29,12 @@ export class ReplayEngine {
   private eventListeners: Map<ReplayEventType, Set<ReplayEventCallback>> = new Map();
   private isPrefetching: boolean = false;
   private isLoadingCurrentTime: boolean = false;
+  private backgroundLoadAborted: boolean = false;
 
   // Throttle React state updates to ~10 per second
   private readonly STATE_EMIT_INTERVAL = 100;
-  // Throttle prefetch to once per second
-  private readonly PREFETCH_INTERVAL = 1000;
+  // Prefetch more aggressively - every 500ms
+  private readonly PREFETCH_INTERVAL = 500;
 
   constructor() {
     this.state = {
@@ -39,11 +49,12 @@ export class ReplayEngine {
 
   /**
    * Load MCAP file from URL
-   * Uses chunked loading - only loads index and initial chunk
+   * Returns quickly after first chunk loads - trajectory and map load in background
    */
   async loadSimulation(url: string): Promise<void> {
     this.updateState({ isLoading: true });
     this.emit('stateChange', this.state);
+    this.backgroundLoadAborted = false;
 
     try {
       // Clean up previous loader
@@ -59,8 +70,8 @@ export class ReplayEngine {
       const index = await loader.loadIndex();
 
       // Check if disposed during async operation
-      if (this.loader !== loader) {
-        return; // Engine was disposed or new load started
+      if (this.loader !== loader || this.backgroundLoadAborted) {
+        return;
       }
 
       this.updateState({
@@ -68,21 +79,99 @@ export class ReplayEngine {
         currentTime: 0,
       });
 
-      // Load initial chunk (around time 0)
+      // Load initial chunk (around time 0) - this is the only blocking load
       await loader.loadTimeRange(0);
 
       // Check if disposed during async operation
-      if (this.loader !== loader) {
-        return; // Engine was disposed or new load started
+      if (this.loader !== loader || this.backgroundLoadAborted) {
+        return;
       }
 
+      // Mark as loaded - scene can render now with first chunk
       this.updateState({ isLoading: false });
       this.emit('loaded', { duration: index.duration });
       this.emit('stateChange', this.state);
+
+      // Emit initial trajectory from first chunk
+      const initialTrajectory = this.getTrajectory();
+      if (initialTrajectory.length > 0) {
+        this.emit('trajectoryUpdate', initialTrajectory);
+      }
+
+      // Start background loading for remaining data
+      this.startBackgroundLoading(loader);
+
     } catch (error) {
       this.updateState({ isLoading: false });
       this.emit('error', error);
       throw error;
+    }
+  }
+
+  /**
+   * Load trajectory and map data in background without blocking
+   */
+  private async startBackgroundLoading(loader: MCAPLoader): Promise<void> {
+    // Load map data in background (don't await)
+    this.loadMapDataInBackground(loader);
+
+    // Proactively load next chunks
+    this.proactivelyLoadChunks(loader);
+  }
+
+  /**
+   * Load map data in background and emit when ready
+   */
+  private async loadMapDataInBackground(loader: MCAPLoader): Promise<void> {
+    try {
+      const mapData = await loader.loadMapData();
+
+      // Check if still valid
+      if (this.loader !== loader || this.backgroundLoadAborted) {
+        return;
+      }
+
+      this.emit('mapDataUpdate', mapData);
+    } catch (err) {
+      console.warn('Background map data load failed:', err);
+    }
+  }
+
+  /**
+   * Proactively load chunks ahead of playback
+   */
+  private async proactivelyLoadChunks(loader: MCAPLoader): Promise<void> {
+    const index = loader.getIndex();
+    if (!index) return;
+
+    const chunkDuration = 5; // seconds per chunk
+    const totalChunks = Math.ceil(index.duration / chunkDuration);
+
+    // Load chunks sequentially in background
+    for (let i = 1; i < totalChunks && i < 10; i++) { // Load up to 10 chunks proactively
+      if (this.loader !== loader || this.backgroundLoadAborted) {
+        return;
+      }
+
+      const targetTime = i * chunkDuration;
+
+      try {
+        await loader.loadTimeRange(targetTime);
+
+        // Check if still valid
+        if (this.loader !== loader || this.backgroundLoadAborted) {
+          return;
+        }
+
+        // Emit updated trajectory after each chunk loads
+        const trajectory = this.getTrajectory();
+        this.emit('trajectoryUpdate', trajectory);
+        this.emit('chunkLoaded', { chunkIndex: i, totalChunks });
+
+      } catch (err) {
+        console.warn(`Background chunk ${i} load failed:`, err);
+        // Continue loading other chunks
+      }
     }
   }
 
@@ -139,6 +228,10 @@ export class ReplayEngine {
       this.loader.loadTimeRange(clampedTime).then(() => {
         this.updateState({ isSeeking: false });
         this.emit('stateChange', this.state);
+
+        // Update trajectory with new data
+        const trajectory = this.getTrajectory();
+        this.emit('trajectoryUpdate', trajectory);
       }).catch((err) => {
         console.warn('Failed to load data for seek:', err);
         this.updateState({ isSeeking: false });
@@ -190,7 +283,7 @@ export class ReplayEngine {
   }
 
   /**
-   * Get vehicle trajectory
+   * Get vehicle trajectory from currently loaded data
    */
   getTrajectory(): Array<{ x: number; y: number; z: number }> {
     return this.loader?.getTrajectory() ?? [];
@@ -198,6 +291,7 @@ export class ReplayEngine {
 
   /**
    * Load the complete trajectory for the entire simulation
+   * @deprecated Use progressive trajectory from chunks instead
    */
   async loadFullTrajectory(): Promise<Array<{ x: number; y: number; z: number }>> {
     return this.loader?.loadFullTrajectory() ?? [];
@@ -205,6 +299,7 @@ export class ReplayEngine {
 
   /**
    * Load map data (semantic map, drivable area, point cloud)
+   * @deprecated Use background loading via mapDataUpdate event instead
    */
   async loadMapData(): Promise<MapData> {
     return this.loader?.loadMapData() ?? {
@@ -236,6 +331,7 @@ export class ReplayEngine {
    * Clean up resources
    */
   dispose(): void {
+    this.backgroundLoadAborted = true;
     this.stopAnimationLoop();
     this.loader?.dispose();
     this.loader = null;
@@ -286,11 +382,12 @@ export class ReplayEngine {
 
       // Check if we need to load data for current time (with lock to prevent duplicate requests)
       if (this.loader && !this.loader.hasDataForTime(newTime) && !this.isLoadingCurrentTime) {
-        console.log(`[Playback] Loading chunk for time ${newTime.toFixed(2)}s...`);
         this.isLoadingCurrentTime = true;
         this.loader.loadTimeRange(newTime)
           .then(() => {
-            console.log(`[Playback] Chunk loaded for time ${newTime.toFixed(2)}s`);
+            // Emit trajectory update when new chunk loads
+            const trajectory = this.getTrajectory();
+            this.emit('trajectoryUpdate', trajectory);
           })
           .catch((err) => {
             console.warn('Failed to load data during playback:', err);
@@ -300,7 +397,7 @@ export class ReplayEngine {
           });
       }
 
-      // Schedule prefetch for upcoming data (throttled to prevent request storms)
+      // Prefetch upcoming data more aggressively
       const shouldPrefetch = this.loader &&
         !this.isPrefetching &&
         (now - this.lastPrefetchTime) >= this.PREFETCH_INTERVAL;
@@ -308,13 +405,20 @@ export class ReplayEngine {
       if (shouldPrefetch) {
         this.lastPrefetchTime = now;
         this.isPrefetching = true;
-        this.loader!.prefetchRange(this.state.currentTime, this.state.playbackRate)
-          .catch((err) => {
-            console.warn('Prefetch failed:', err);
-          })
-          .finally(() => {
-            this.isPrefetching = false;
-          });
+
+        // Prefetch 2 chunks ahead
+        const prefetchTime = this.state.currentTime + 10 * this.state.playbackRate;
+        if (prefetchTime <= this.state.duration) {
+          this.loader!.prefetchRange(this.state.currentTime, this.state.playbackRate)
+            .catch((err) => {
+              console.warn('Prefetch failed:', err);
+            })
+            .finally(() => {
+              this.isPrefetching = false;
+            });
+        } else {
+          this.isPrefetching = false;
+        }
       }
 
       this.updateState({ currentTime: newTime });
