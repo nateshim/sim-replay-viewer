@@ -2,12 +2,17 @@ import { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
 import type { Simulation } from '../../types';
 import { fetchSimulations, formatFileSize } from '../../simulations/simulationService';
+import MCAPInspectorModal from '../mcap-inspector/MCAPInspectorModal';
 import './SimulationList.css';
 
 function SimulationList() {
   const [simulations, setSimulations] = useState<Simulation[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  // Modal state
+  const [inspectorOpen, setInspectorOpen] = useState(false);
+  const [selectedSimulation, setSelectedSimulation] = useState<Simulation | null>(null);
 
   useEffect(() => {
     async function loadSimulations() {
@@ -25,6 +30,18 @@ function SimulationList() {
 
     loadSimulations();
   }, []);
+
+  const handleInspect = (sim: Simulation, e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setSelectedSimulation(sim);
+    setInspectorOpen(true);
+  };
+
+  const closeInspector = () => {
+    setInspectorOpen(false);
+    setSelectedSimulation(null);
+  };
 
   if (loading) {
     return (
@@ -72,30 +89,43 @@ function SimulationList() {
         ) : (
           <div className="simulation-grid">
             {simulations.map((sim) => (
-              <Link
-                key={sim.id}
-                to={`/viewer/${sim.id}`}
-                className="simulation-card"
-              >
-                <div className="simulation-icon">
-                  <svg viewBox="0 0 24 24" fill="currentColor">
-                    <path d="M8 5v14l11-7z" />
-                  </svg>
-                </div>
-                <div className="simulation-info">
-                  <h3 className="simulation-name">{sim.name}</h3>
-                  <div className="simulation-meta">
-                    <span className="simulation-size">{formatFileSize(sim.size)}</span>
-                    <span className="simulation-date">
-                      {sim.lastModified.toLocaleDateString()}
-                    </span>
+              <div key={sim.id} className="simulation-card">
+                <Link to={`/viewer/${sim.id}`} className="simulation-card-link">
+                  <div className="simulation-icon">
+                    <svg viewBox="0 0 24 24" fill="currentColor">
+                      <path d="M8 5v14l11-7z" />
+                    </svg>
                   </div>
-                </div>
-              </Link>
+                  <div className="simulation-info">
+                    <h3 className="simulation-name">{sim.name}</h3>
+                    <div className="simulation-meta">
+                      <span className="simulation-size">{formatFileSize(sim.size)}</span>
+                      <span className="simulation-date">
+                        {sim.lastModified.toLocaleDateString()}
+                      </span>
+                    </div>
+                  </div>
+                </Link>
+                <button
+                  className="simulation-inspect-btn"
+                  onClick={(e) => handleInspect(sim, e)}
+                >
+                  Inspect
+                </button>
+              </div>
             ))}
           </div>
         )}
       </div>
+
+      {selectedSimulation && (
+        <MCAPInspectorModal
+          isOpen={inspectorOpen}
+          onClose={closeInspector}
+          simulationName={selectedSimulation.name}
+          simulationUrl={selectedSimulation.url}
+        />
+      )}
     </div>
   );
 }
