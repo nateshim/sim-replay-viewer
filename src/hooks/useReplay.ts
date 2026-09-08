@@ -43,7 +43,9 @@ export function useReplay(simulationUrl: string | null) {
 
     // Subscribe to trajectory updates (progressive loading)
     engine.on('trajectoryUpdate', (trajectory) => {
-      setFullTrajectory(trajectory as Array<{ x: number; y: number; z: number }>);
+      const traj = trajectory as Array<{ x: number; y: number; z: number }>;
+      console.log(`[useReplay] trajectoryUpdate received: ${traj.length} points`);
+      setFullTrajectory(traj);
     });
 
     // Subscribe to map data updates (background loading)

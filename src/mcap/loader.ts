@@ -15,7 +15,7 @@ const decompressHandlers = {
 
 /**
  * Custom IReadable implementation for HTTP range requests
- * Uses a simple sequential approach to prevent browser resource exhaustion
+ * Uses limited concurrency to balance speed and browser resource limits
  */
 class HttpRangeReader {
   private url: string;
@@ -23,8 +23,15 @@ class HttpRangeReader {
   private abortController: AbortController;
   private isAborted: boolean = false;
 
-  // Sequential request handling - only one request at a time
-  private pendingRequest: Promise<Uint8Array> | null = null;
+  // Allow up to 3 concurrent requests (browser limit is typically 6 per host)
+  private activeRequests: number = 0;
+  private readonly maxConcurrent: number = 3;
+  private requestQueue: Array<{
+    offset: bigint;
+    length: bigint;
+    resolve: (data: Uint8Array) => void;
+    reject: (err: Error) => void;
+  }> = [];
 
   constructor(url: string) {
     this.url = url;
@@ -51,41 +58,58 @@ class HttpRangeReader {
       throw new Error('Reader has been aborted');
     }
 
-    // Wait for any pending request to complete before starting a new one
-    // This serializes requests to prevent overwhelming the browser
-    if (this.pendingRequest) {
-      try {
-        await this.pendingRequest;
-      } catch {
-        // Ignore errors from previous request
-      }
+    // If under concurrency limit, execute immediately
+    if (this.activeRequests < this.maxConcurrent) {
+      return this.executeRead(offset, length);
     }
 
-    const request = this.executeRead(offset, length);
-    this.pendingRequest = request;
-    return request;
+    // Otherwise queue the request
+    return new Promise((resolve, reject) => {
+      this.requestQueue.push({ offset, length, resolve, reject });
+    });
   }
 
   /**
    * Execute an HTTP range request
    */
   private async executeRead(offset: bigint, length: bigint): Promise<Uint8Array> {
-    const start = Number(offset);
-    const end = Number(offset + length) - 1;
+    this.activeRequests++;
 
-    const response = await fetch(this.url, {
-      headers: {
-        Range: `bytes=${start}-${end}`,
-      },
-      signal: this.abortController.signal,
-    });
+    try {
+      const start = Number(offset);
+      const end = Number(offset + length) - 1;
 
-    if (!response.ok && response.status !== 206) {
-      throw new Error(`HTTP range request failed: ${response.status}`);
+      const response = await fetch(this.url, {
+        headers: {
+          Range: `bytes=${start}-${end}`,
+        },
+        signal: this.abortController.signal,
+      });
+
+      if (!response.ok && response.status !== 206) {
+        throw new Error(`HTTP range request failed: ${response.status}`);
+      }
+
+      const buffer = await response.arrayBuffer();
+      return new Uint8Array(buffer);
+    } finally {
+      this.activeRequests--;
+      this.processQueue();
     }
+  }
 
-    const buffer = await response.arrayBuffer();
-    return new Uint8Array(buffer);
+  /**
+   * Process queued requests
+   */
+  private processQueue(): void {
+    while (this.requestQueue.length > 0 && this.activeRequests < this.maxConcurrent) {
+      const req = this.requestQueue.shift()!;
+      if (this.isAborted) {
+        req.reject(new Error('Reader has been aborted'));
+      } else {
+        this.executeRead(req.offset, req.length).then(req.resolve).catch(req.reject);
+      }
+    }
   }
 
   /**
@@ -94,6 +118,11 @@ class HttpRangeReader {
   abort(): void {
     this.isAborted = true;
     this.abortController.abort();
+    // Reject all queued requests
+    for (const req of this.requestQueue) {
+      req.reject(new Error('Reader has been aborted'));
+    }
+    this.requestQueue = [];
   }
 }
 
@@ -297,15 +326,6 @@ export class MCAPLoader {
       (s) => `${s.name} (encoding: ${s.encoding})`
     );
 
-    // Log all available topics and schemas for debugging
-    console.log('=== MCAP File Contents ===');
-    console.log('Schemas:', this.schemasInfo);
-    console.log('Topics:');
-    for (const [id, channel] of this.reader.channelsById) {
-      const schema = this.reader.schemasById.get(channel.schemaId);
-      console.log(`  ${channel.topic} -> ${schema?.name ?? 'unknown'} (channel ${id})`);
-    }
-
     // Calculate time range from chunk indexes
     let startTime = Number.MAX_SAFE_INTEGER;
     let endTime = 0;
@@ -425,22 +445,6 @@ export class MCAPLoader {
       const schema = this.reader.schemasById.get(channel.schemaId);
       const schemaName = schema?.name ?? 'unknown';
 
-      // Debug: log first message of each topic/schema combination
-      const topicKey = `${channel.topic}:${schemaName}`;
-      if (!loggedTopics.has(topicKey) && msgCount < 20) {
-        loggedTopics.add(topicKey);
-        msgCount++;
-        console.log(`Topic: ${channel.topic}, Schema: ${schemaName}, Encoding: ${channel.messageEncoding}`);
-        try {
-          const decoder = new TextDecoder();
-          const jsonStr = decoder.decode(msg.data);
-          const parsed = JSON.parse(jsonStr);
-          console.log(`  Data sample:`, JSON.stringify(parsed, null, 2).slice(0, 500));
-        } catch (e) {
-          console.log(`  Data: [Binary, ${msg.data.length} bytes]`);
-        }
-      }
-
       const result = this.parseVehicleState(
         msg.data,
         timestamp,
@@ -486,6 +490,10 @@ export class MCAPLoader {
       const last = states[states.length - 1];
       console.log(`  Chunk positions: (${first.position.x.toFixed(2)}, ${first.position.y.toFixed(2)}) -> (${last.position.x.toFixed(2)}, ${last.position.y.toFixed(2)})`);
     }
+
+    // Log total trajectory points after this chunk
+    const totalStates = this.rangeCache.getAllStates();
+    console.log(`  Total trajectory points after this chunk: ${totalStates.length}`);
 
     // Log if no data was parsed (for debugging)
     if (states.length === 0) {
@@ -560,6 +568,12 @@ export class MCAPLoader {
             if (decoded && typeof decoded === 'object') {
               const poseInFrame = decoded as { pose?: { position?: { x: number; y: number; z: number }; orientation?: { x: number; y: number; z: number; w: number } } };
               if (poseInFrame.pose?.position) {
+                // Log successful parse every 100 messages
+                const logKey = `parsed_protobuf_${Math.floor(timestamp)}`;
+                if (!this.loggedSchemas.has(logKey)) {
+                  this.loggedSchemas.add(logKey);
+                  console.log(`[parseVehicleState] Successfully parsed PoseInFrame at t=${timestamp.toFixed(2)}s: pos=(${poseInFrame.pose.position.x.toFixed(2)}, ${poseInFrame.pose.position.y.toFixed(2)})`);
+                }
                 return {
                   state: {
                     timestamp,
@@ -593,15 +607,6 @@ export class MCAPLoader {
       const decoder = new TextDecoder();
       const jsonStr = decoder.decode(data);
       const parsed = JSON.parse(jsonStr);
-
-      // Debug: log first message of each topic/schema combination
-      const topicSchemaKey = `parsed_${topic}_${schemaName}`;
-      if (!this.loggedSchemas.has(topicSchemaKey)) {
-        this.loggedSchemas.add(topicSchemaKey);
-        console.log(`[parseVehicleState] Topic: ${topic}, Schema: ${schemaName}`);
-        console.log(`  ALL FIELDS:`, Object.keys(parsed));
-        console.log(`  Full message:`, JSON.stringify(parsed, null, 2).slice(0, 1500));
-      }
 
       // Try various pose data structures
       let position = { x: 0, y: 0, z: 0 };

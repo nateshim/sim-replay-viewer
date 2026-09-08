@@ -94,6 +94,7 @@ export class ReplayEngine {
 
       // Emit initial trajectory from first chunk
       const initialTrajectory = this.getTrajectory();
+      console.log(`[ReplayEngine] Initial trajectory after first chunk: ${initialTrajectory.length} points`);
       if (initialTrajectory.length > 0) {
         this.emit('trajectoryUpdate', initialTrajectory);
       }
@@ -112,6 +113,7 @@ export class ReplayEngine {
    * Load trajectory and map data in background without blocking
    */
   private async startBackgroundLoading(loader: MCAPLoader): Promise<void> {
+    console.log('[ReplayEngine] Starting background loading...');
     // Load map data in background (don't await)
     this.loadMapDataInBackground(loader);
 
@@ -142,10 +144,14 @@ export class ReplayEngine {
    */
   private async proactivelyLoadChunks(loader: MCAPLoader): Promise<void> {
     const index = loader.getIndex();
-    if (!index) return;
+    if (!index) {
+      console.log('[ReplayEngine] proactivelyLoadChunks: No index available');
+      return;
+    }
 
     const chunkDuration = 5; // seconds per chunk
     const totalChunks = Math.ceil(index.duration / chunkDuration);
+    console.log(`[ReplayEngine] proactivelyLoadChunks: Duration=${index.duration.toFixed(2)}s, totalChunks=${totalChunks}`);
 
     // Load chunks sequentially in background
     for (let i = 1; i < totalChunks && i < 10; i++) { // Load up to 10 chunks proactively
@@ -165,6 +171,7 @@ export class ReplayEngine {
 
         // Emit updated trajectory after each chunk loads
         const trajectory = this.getTrajectory();
+        console.log(`[ReplayEngine] Chunk ${i}/${totalChunks} loaded, emitting trajectoryUpdate with ${trajectory.length} points`);
         this.emit('trajectoryUpdate', trajectory);
         this.emit('chunkLoaded', { chunkIndex: i, totalChunks });
 
@@ -286,7 +293,9 @@ export class ReplayEngine {
    * Get vehicle trajectory from currently loaded data
    */
   getTrajectory(): Array<{ x: number; y: number; z: number }> {
-    return this.loader?.getTrajectory() ?? [];
+    const trajectory = this.loader?.getTrajectory() ?? [];
+    console.log(`[ReplayEngine.getTrajectory] ${trajectory.length} points`);
+    return trajectory;
   }
 
   /**

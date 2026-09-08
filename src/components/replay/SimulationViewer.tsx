@@ -76,9 +76,9 @@ function SimulationViewer() {
       const vehicleState = getCurrentVehicleState();
       setCurrentVehicleState(vehicleState);
 
-      // Debug: log vehicle state periodically
+      // Debug: log vehicle state periodically (only after loading completes)
       const now = performance.now();
-      if (now - lastLogTime > 2000) {
+      if (now - lastLogTime > 2000 && !state.isLoading) {
         lastLogTime = now;
         if (vehicleState) {
           console.log('Vehicle state:', {
@@ -87,7 +87,7 @@ function SimulationViewer() {
             speed: vehicleState.speed.toFixed(2),
           });
         } else {
-          console.log('Vehicle state: null (no data loaded for current time)');
+          console.log('Vehicle state: null (data may still be loading for current time)');
         }
       }
 
@@ -110,7 +110,7 @@ function SimulationViewer() {
         cancelAnimationFrame(animationFrameRef.current);
       }
     };
-  }, [getCurrentVehicleState, measureFrame]);
+  }, [getCurrentVehicleState, measureFrame, state.isLoading]);
 
   // Keyboard controls
   useEffect(() => {
