@@ -16,6 +16,8 @@ function parseSchema(schemaData: Uint8Array, schemaName: string): protobuf.Root 
     return rootCache.get(cacheKey)!;
   }
 
+  const parseStartTime = performance.now();
+
   // Try to detect format - .proto text starts with "syntax" or comments
   const schemaText = new TextDecoder().decode(schemaData.slice(0, 100));
   const isTextFormat = schemaText.startsWith('syntax') ||
@@ -23,7 +25,7 @@ function parseSchema(schemaData: Uint8Array, schemaName: string): protobuf.Root 
                        schemaText.startsWith('package') ||
                        schemaText.trimStart().startsWith('message ');
 
-  console.log(`Parsing schema ${schemaName}, isTextFormat: ${isTextFormat}`);
+  console.log(`[parseSchema] Parsing schema ${schemaName}, isTextFormat: ${isTextFormat}, size: ${schemaData.length} bytes`);
 
   try {
     let root: protobuf.Root;
@@ -39,6 +41,8 @@ function parseSchema(schemaData: Uint8Array, schemaName: string): protobuf.Root 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       root = (protobuf.Root as any).fromDescriptor(decodedDescriptor);
     }
+
+    console.log(`[parseSchema] Schema ${schemaName} parsed in ${(performance.now() - parseStartTime).toFixed(0)}ms`);
 
     rootCache.set(cacheKey, root);
     return root;

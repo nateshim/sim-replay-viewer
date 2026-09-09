@@ -69,11 +69,17 @@ class HttpRangeReader {
     });
   }
 
+  // Track request count for logging
+  private requestCount = 0;
+
   /**
    * Execute an HTTP range request
    */
   private async executeRead(offset: bigint, length: bigint): Promise<Uint8Array> {
     this.activeRequests++;
+    this.requestCount++;
+    const reqNum = this.requestCount;
+    const reqStartTime = performance.now();
 
     try {
       const start = Number(offset);
@@ -275,8 +281,63 @@ export class MCAPLoader {
   // Chunk duration for loading (in seconds)
   private chunkDuration: number = 5;
 
+  // Cached pose topics (computed once after index load)
+  private poseTopics: string[] | null = null;
+
   constructor(url: string) {
     this.url = url;
+  }
+
+  /**
+   * Get topics that contain pose/vehicle state data
+   * Filters out LIDAR, map data, markers, etc. that are loaded separately
+   */
+  private getPoseTopics(): string[] {
+    if (this.poseTopics) {
+      return this.poseTopics;
+    }
+
+    if (!this.reader) {
+      return [];
+    }
+
+    const topics: string[] = [];
+    const poseSchemaNames = [
+      'foxglove.PoseInFrame',
+      'PoseInFrame',
+      'Pose',
+      'geometry_msgs/Pose',
+      'nav_msgs/Odometry',
+    ];
+
+    // Exclude topics that are loaded separately via loadMapData()
+    const excludedTopics = [
+      '/semantic_map',
+      '/drivable_area',
+      '/LIDAR_TOP',
+      '/markers/annotations',
+    ];
+
+    for (const [, channel] of this.reader.channelsById) {
+      const schema = this.reader.schemasById.get(channel.schemaId);
+      if (!schema) continue;
+
+      // Check if this is a pose-related schema
+      const isPoseSchema = poseSchemaNames.some(
+        (name) => schema.name === name || schema.name.includes(name)
+      );
+
+      // Skip excluded topics (map data loaded separately)
+      const isExcluded = excludedTopics.includes(channel.topic);
+
+      if (isPoseSchema && !isExcluded) {
+        topics.push(channel.topic);
+      }
+    }
+
+    console.log(`[getPoseTopics] Found pose topics:`, topics);
+    this.poseTopics = topics;
+    return topics;
   }
 
   /**
@@ -284,15 +345,22 @@ export class MCAPLoader {
    * This is fast and allows immediate playback UI
    */
   async loadIndex(): Promise<MCAPFileIndex> {
+    console.log('[loadIndex] Starting...');
+    const indexStartTime = performance.now();
+
     // Abort any previous reader
     this.httpReader?.abort();
 
     const httpReader = new HttpRangeReader(this.url);
     this.httpReader = httpReader;
+
+    console.log('[loadIndex] Initializing McapIndexedReader...');
+    const readerInitStart = performance.now();
     this.reader = await McapIndexedReader.Initialize({
       readable: httpReader,
       decompressHandlers,
     });
+    console.log(`[loadIndex] McapIndexedReader.Initialize() took ${(performance.now() - readerInitStart).toFixed(0)}ms`);
 
     // Build index from reader
     const chunkIndexes = [...this.reader.chunkIndexes];
@@ -357,6 +425,9 @@ export class MCAPLoader {
       messageCount,
     };
 
+    console.log(`[loadIndex] Complete. Total time: ${(performance.now() - indexStartTime).toFixed(0)}ms`);
+    console.log(`[loadIndex] Duration: ${(endTime - startTime).toFixed(2)}s, ${messageCount} messages, ${chunkIndexes.length} chunks`);
+
     return this.index;
   }
 
@@ -413,6 +484,8 @@ export class MCAPLoader {
   private async doLoadRange(startTime: number, endTime: number): Promise<void> {
     if (!this.reader || !this.index) return;
 
+    const loadStartTime = performance.now();
+
     const startTimeNs = BigInt(Math.floor(startTime * 1e9));
     const endTimeNs = BigInt(Math.floor(endTime * 1e9));
 
@@ -420,6 +493,10 @@ export class MCAPLoader {
     const baseTime = this.index.startTime;
 
     console.log(`[doLoadRange] Loading absolute time ${startTime.toFixed(2)} - ${endTime.toFixed(2)} (relative: ${(startTime - baseTime).toFixed(2)} - ${(endTime - baseTime).toFixed(2)})`);
+
+    // Find pose topics to filter - we only need pose data for playback
+    const poseTopics = this.getPoseTopics();
+    console.log(`[doLoadRange] Filtering to pose topics: ${poseTopics.join(', ')}`);
 
     const states: VehicleState[] = [];
     const telemetry: TelemetryPoint[] = [];
@@ -429,10 +506,14 @@ export class MCAPLoader {
     let msgCount = 0;
     const loggedTopics = new Set<string>();
 
-    // Read only messages in the time range
+    console.log(`[doLoadRange] Starting message iteration...`);
+    const iterStartTime = performance.now();
+
+    // Read only pose messages in the time range (not LIDAR, map data, etc.)
     for await (const msg of this.reader.readMessages({
       startTime: startTimeNs,
       endTime: endTimeNs,
+      topics: poseTopics,
     })) {
       // Convert absolute timestamp to relative (0 to duration)
       const absoluteTimestamp = Number(msg.logTime) / 1e9;
@@ -465,7 +546,10 @@ export class MCAPLoader {
       } else if (result.error && parseErrors.length < 3) {
         parseErrors.push(result.error);
       }
+      msgCount++;
     }
+
+    console.log(`[doLoadRange] Message iteration complete: ${msgCount} messages in ${(performance.now() - iterStartTime).toFixed(0)}ms`);
 
     // Sort by timestamp
     states.sort((a, b) => a.timestamp - b.timestamp);
@@ -503,6 +587,8 @@ export class MCAPLoader {
         parseErrors.length > 0 ? `Parse errors: ${parseErrors.join('; ')}` : ''
       );
     }
+
+    console.log(`[doLoadRange] Total time: ${(performance.now() - loadStartTime).toFixed(0)}ms`);
   }
 
   /**
@@ -1076,9 +1162,10 @@ export class MCAPLoader {
    */
   async loadMapData(): Promise<MapData> {
     console.log('=== MCAPLoader.loadMapData called ===');
+    const mapLoadStartTime = performance.now();
 
-    if (!this.reader) {
-      console.warn('loadMapData: No reader available');
+    if (!this.reader || !this.index) {
+      console.warn('[loadMapData] No reader or index available');
       return { semanticMap: null, drivableArea: null, pointCloud: null, markers: null };
     }
 
@@ -1106,17 +1193,31 @@ export class MCAPLoader {
       }
     }
 
-    console.log('loadMapData: Found topics:', Object.keys(topicMap));
+    console.log('[loadMapData] Found topics:', Object.keys(topicMap));
 
     // Read one message from each topic (map data is typically static)
     const topics = Object.keys(topicMap);
     if (topics.length === 0) {
-      console.log('loadMapData: No map topics found');
+      console.log('[loadMapData] No map topics found');
       return mapData;
     }
 
+    // Only read messages from the first second of the simulation
+    // Map data is static, so first message of each topic is sufficient
+    const startTimeNs = BigInt(Math.floor(this.index.startTime * 1e9));
+    const endTimeNs = BigInt(Math.floor((this.index.startTime + 1) * 1e9));
+    console.log(`[loadMapData] Time filter: first 1 second only`);
+
+    let messageCount = 0;
+    const iterStartTime = performance.now();
+
     try {
-      for await (const msg of this.reader.readMessages({ topics })) {
+      for await (const msg of this.reader.readMessages({
+        topics,
+        startTime: startTimeNs,
+        endTime: endTimeNs,
+      })) {
+        messageCount++;
         // Look up channel to get topic name
         const channel = this.reader.channelsById.get(msg.channelId);
         if (!channel) continue;
@@ -1127,33 +1228,33 @@ export class MCAPLoader {
 
         // Only process first message of each topic
         if (topic === '/semantic_map' && !mapData.semanticMap) {
-          console.log('loadMapData: Decoding semantic_map...');
+          const decodeStart = performance.now();
           const decoded = decodeProtobuf(msg.data, topicInfo.schemaData, topicInfo.schemaName);
           if (decoded) {
             mapData.semanticMap = decoded as SceneUpdate;
-            console.log('loadMapData: semantic_map loaded, entities:', mapData.semanticMap.entities?.length ?? 0);
+            console.log(`[loadMapData] /semantic_map decoded in ${(performance.now() - decodeStart).toFixed(0)}ms, entities: ${mapData.semanticMap.entities?.length ?? 0}`);
           }
         } else if (topic === '/drivable_area' && !mapData.drivableArea) {
-          console.log('loadMapData: Decoding drivable_area...');
+          const decodeStart = performance.now();
           const decoded = decodeProtobuf(msg.data, topicInfo.schemaData, topicInfo.schemaName);
           if (decoded) {
             mapData.drivableArea = decoded as Grid;
-            console.log('loadMapData: drivable_area loaded, size:', mapData.drivableArea.columnCount, 'x', (mapData.drivableArea.data?.length ?? 0) / (mapData.drivableArea.rowStride || 1));
+            console.log(`[loadMapData] /drivable_area decoded in ${(performance.now() - decodeStart).toFixed(0)}ms, size: ${mapData.drivableArea.columnCount}x${Math.floor((mapData.drivableArea.data?.length ?? 0) / (mapData.drivableArea.rowStride || 1))}`);
           }
         } else if (topic === '/LIDAR_TOP' && !mapData.pointCloud) {
-          console.log('loadMapData: Decoding LIDAR_TOP...');
+          const decodeStart = performance.now();
           const decoded = decodeProtobuf(msg.data, topicInfo.schemaData, topicInfo.schemaName);
           if (decoded) {
             mapData.pointCloud = decoded as PointCloud;
-            const numPoints = (mapData.pointCloud.data?.length ?? 0) / (mapData.pointCloud.pointStride || 1);
-            console.log('loadMapData: LIDAR_TOP loaded, points:', numPoints);
+            const numPoints = Math.floor((mapData.pointCloud.data?.length ?? 0) / (mapData.pointCloud.pointStride || 1));
+            console.log(`[loadMapData] /LIDAR_TOP decoded in ${(performance.now() - decodeStart).toFixed(0)}ms, points: ${numPoints}`);
           }
         } else if (topic === '/markers/annotations' && !mapData.markers) {
-          console.log('loadMapData: Decoding markers/annotations...');
+          const decodeStart = performance.now();
           const decoded = decodeProtobuf(msg.data, topicInfo.schemaData, topicInfo.schemaName);
           if (decoded) {
             mapData.markers = decoded as SceneUpdate;
-            console.log('loadMapData: markers loaded, entities:', mapData.markers.entities?.length ?? 0);
+            console.log(`[loadMapData] /markers decoded in ${(performance.now() - decodeStart).toFixed(0)}ms, entities: ${mapData.markers.entities?.length ?? 0}`);
           }
         }
 
@@ -1163,10 +1264,13 @@ export class MCAPLoader {
         }
       }
     } catch (err) {
-      console.error('loadMapData: Error reading messages:', err);
+      console.error('[loadMapData] Error reading messages:', err);
     }
 
-    console.log('loadMapData: Complete');
+    const iterTime = performance.now() - iterStartTime;
+    const totalTime = performance.now() - mapLoadStartTime;
+    console.log(`[loadMapData] Message iteration: ${messageCount} messages in ${iterTime.toFixed(0)}ms`);
+    console.log(`[loadMapData] Complete. Total time: ${totalTime.toFixed(0)}ms`);
     return mapData;
   }
 

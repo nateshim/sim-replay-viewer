@@ -52,6 +52,9 @@ export class ReplayEngine {
    * Returns quickly after first chunk loads - trajectory and map load in background
    */
   async loadSimulation(url: string): Promise<void> {
+    console.log('[ReplayEngine] loadSimulation starting...');
+    const totalStartTime = performance.now();
+
     this.updateState({ isLoading: true });
     this.emit('stateChange', this.state);
     this.backgroundLoadAborted = false;
@@ -67,7 +70,10 @@ export class ReplayEngine {
       this.loader = loader;
 
       // Load index first (fast - metadata only)
+      console.log('[ReplayEngine] Step 1: Loading index...');
+      const indexStartTime = performance.now();
       const index = await loader.loadIndex();
+      console.log(`[ReplayEngine] Step 1 complete: Index loaded in ${(performance.now() - indexStartTime).toFixed(0)}ms`);
 
       // Check if disposed during async operation
       if (this.loader !== loader || this.backgroundLoadAborted) {
@@ -80,7 +86,10 @@ export class ReplayEngine {
       });
 
       // Load initial chunk (around time 0) - this is the only blocking load
+      console.log('[ReplayEngine] Step 2: Loading first chunk (time 0)...');
+      const chunkStartTime = performance.now();
       await loader.loadTimeRange(0);
+      console.log(`[ReplayEngine] Step 2 complete: First chunk loaded in ${(performance.now() - chunkStartTime).toFixed(0)}ms`);
 
       // Check if disposed during async operation
       if (this.loader !== loader || this.backgroundLoadAborted) {
@@ -91,6 +100,8 @@ export class ReplayEngine {
       this.updateState({ isLoading: false });
       this.emit('loaded', { duration: index.duration });
       this.emit('stateChange', this.state);
+
+      console.log(`[ReplayEngine] Initial load complete. Total blocking time: ${(performance.now() - totalStartTime).toFixed(0)}ms`);
 
       // Emit initial trajectory from first chunk
       const initialTrajectory = this.getTrajectory();
