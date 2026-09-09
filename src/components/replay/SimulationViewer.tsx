@@ -50,12 +50,6 @@ function SimulationViewer() {
   useEffect(() => {
     if (sceneRef.current && fullTrajectory.length > 0) {
       sceneRef.current.setTrajectory(fullTrajectory);
-      // Debug: log trajectory info
-      const first = fullTrajectory[0];
-      const last = fullTrajectory[fullTrajectory.length - 1];
-      console.log(`Trajectory loaded: ${fullTrajectory.length} points`);
-      console.log(`  First point: (${first.x.toFixed(2)}, ${first.y.toFixed(2)}, ${first.z.toFixed(2)})`);
-      console.log(`  Last point: (${last.x.toFixed(2)}, ${last.y.toFixed(2)}, ${last.z.toFixed(2)})`);
     }
   }, [fullTrajectory]);
 
@@ -69,27 +63,10 @@ function SimulationViewer() {
 
   // Animation loop
   useEffect(() => {
-    let lastLogTime = 0;
-
     const animate = () => {
       // Get current vehicle state
       const vehicleState = getCurrentVehicleState();
       setCurrentVehicleState(vehicleState);
-
-      // Debug: log vehicle state periodically (only after loading completes)
-      const now = performance.now();
-      if (now - lastLogTime > 2000 && !state.isLoading) {
-        lastLogTime = now;
-        if (vehicleState) {
-          console.log('Vehicle state:', {
-            time: vehicleState.timestamp.toFixed(2),
-            pos: `(${vehicleState.position.x.toFixed(2)}, ${vehicleState.position.y.toFixed(2)}, ${vehicleState.position.z.toFixed(2)})`,
-            speed: vehicleState.speed.toFixed(2),
-          });
-        } else {
-          console.log('Vehicle state: null (data may still be loading for current time)');
-        }
-      }
 
       // Update Three.js scene
       if (sceneRef.current) {
