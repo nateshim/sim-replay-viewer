@@ -29,6 +29,7 @@ function SimulationViewer() {
     skip,
     setPlaybackRate,
     getCurrentVehicleState,
+    getCurrentDynamicObjects,
   } = useReplay(simulationUrl);
 
   const { fps, measureFrame } = useFrameRate();
@@ -68,9 +69,18 @@ function SimulationViewer() {
       const vehicleState = getCurrentVehicleState();
       setCurrentVehicleState(vehicleState);
 
+      // Get current dynamic objects (other vehicles)
+      const dynamicObjects = getCurrentDynamicObjects();
+
       // Update Three.js scene
       if (sceneRef.current) {
         sceneRef.current.updateVehicle(vehicleState);
+
+        // Update dynamic objects if available
+        if (dynamicObjects) {
+          sceneRef.current.updateDynamicObjects(dynamicObjects);
+        }
+
         sceneRef.current.render();
       }
 
@@ -87,7 +97,7 @@ function SimulationViewer() {
         cancelAnimationFrame(animationFrameRef.current);
       }
     };
-  }, [getCurrentVehicleState, measureFrame, state.isLoading]);
+  }, [getCurrentVehicleState, getCurrentDynamicObjects, measureFrame, state.isLoading]);
 
   // Keyboard controls
   useEffect(() => {

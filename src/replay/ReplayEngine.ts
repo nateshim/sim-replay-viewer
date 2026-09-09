@@ -1,5 +1,5 @@
 import type { ReplayState, VehicleState, TelemetryPoint } from '../types';
-import type { MapData } from '../mcap/types';
+import type { MapData, SceneEntity } from '../mcap/types';
 import { MCAPLoader } from '../mcap/loader';
 
 export type ReplayEventType =
@@ -305,6 +305,14 @@ export class ReplayEngine {
   }
 
   /**
+   * Get dynamic objects (other vehicles) at current time
+   */
+  getCurrentDynamicObjects(): SceneEntity[] | null {
+    if (!this.loader) return null;
+    return this.loader.getDynamicObjectsAtTime(this.state.currentTime);
+  }
+
+  /**
    * Get vehicle trajectory from currently loaded data
    */
   getTrajectory(): Array<{ x: number; y: number; z: number }> {
@@ -331,6 +339,7 @@ export class ReplayEngine {
       drivableArea: null,
       pointCloud: null,
       markers: null,
+      dynamicObjects: null,
     };
   }
 

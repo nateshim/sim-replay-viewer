@@ -130,4 +130,5 @@ export interface MapData {
   drivableArea: Grid | null;
   pointCloud: PointCloud | null;
   markers: SceneUpdate | null;
+  dynamicObjects: SceneUpdate | null;  // /markers/car - other vehicles
 }

@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import type { ReplayState, VehicleState, TelemetryPoint } from '../types';
-import type { MapData } from '../mcap/types';
+import type { MapData, SceneEntity } from '../mcap/types';
 import { ReplayEngine } from '../replay/ReplayEngine';
 
 /**
@@ -134,6 +134,10 @@ export function useReplay(simulationUrl: string | null) {
     return engineRef.current?.getTrajectory() ?? [];
   }, []);
 
+  const getCurrentDynamicObjects = useCallback((): SceneEntity[] | null => {
+    return engineRef.current?.getCurrentDynamicObjects() ?? null;
+  }, []);
+
   return {
     state,
     error,
@@ -148,5 +152,6 @@ export function useReplay(simulationUrl: string | null) {
     setPlaybackRate,
     getCurrentVehicleState,
     getTrajectory,
+    getCurrentDynamicObjects,
   };
 }

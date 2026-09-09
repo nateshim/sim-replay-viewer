@@ -1,6 +1,6 @@
 import { McapIndexedReader } from '@mcap/core';
 import * as lz4 from 'lz4js';
-import type { MCAPFileIndex, MapData, SceneUpdate, Grid, PointCloud } from './types';
+import type { MCAPFileIndex, MapData, SceneUpdate, SceneEntity, Grid, PointCloud } from './types';
 import type { VehicleState, TelemetryPoint } from '../types';
 import { decodeProtobuf, clearProtobufCache } from './protobufDecoder';
 
@@ -78,8 +78,6 @@ class HttpRangeReader {
   private async executeRead(offset: bigint, length: bigint): Promise<Uint8Array> {
     this.activeRequests++;
     this.requestCount++;
-    const reqNum = this.requestCount;
-    const reqStartTime = performance.now();
 
     try {
       const start = Number(offset);
@@ -133,6 +131,14 @@ class HttpRangeReader {
 }
 
 /**
+ * A frame of dynamic objects at a specific timestamp
+ */
+interface DynamicObjectFrame {
+  timestamp: number;
+  entities: SceneEntity[];
+}
+
+/**
  * Represents a loaded time range with its data
  */
 interface LoadedRange {
@@ -140,6 +146,7 @@ interface LoadedRange {
   endTime: number;
   states: VehicleState[];
   telemetry: TelemetryPoint[];
+  dynamicObjects: DynamicObjectFrame[];
 }
 
 /**
@@ -181,27 +188,31 @@ class RangeCache {
         (r) => range.endTime < r.startTime || range.startTime > r.endTime
       );
 
-      // Merge all states and telemetry
+      // Merge all states, telemetry, and dynamic objects
       const allStates = [...range.states];
       const allTelemetry = [...range.telemetry];
+      const allDynamicObjects = [...(range.dynamicObjects || [])];
 
       for (const r of overlapping) {
         allStates.push(...r.states);
         allTelemetry.push(...r.telemetry);
+        allDynamicObjects.push(...(r.dynamicObjects || []));
       }
 
       // Sort and dedupe by timestamp
       allStates.sort((a, b) => a.timestamp - b.timestamp);
       allTelemetry.sort((a, b) => a.timestamp - b.timestamp);
+      allDynamicObjects.sort((a, b) => a.timestamp - b.timestamp);
 
       const mergedRange: LoadedRange = {
         startTime: Math.min(range.startTime, ...overlapping.map((r) => r.startTime)),
         endTime: Math.max(range.endTime, ...overlapping.map((r) => r.endTime)),
         states: this.dedupeByTimestamp(allStates),
         telemetry: this.dedupeByTimestamp(allTelemetry),
+        dynamicObjects: this.dedupeByTimestamp(allDynamicObjects),
       };
 
-      console.log(`[RangeCache] Merged range: ${mergedRange.startTime.toFixed(2)}-${mergedRange.endTime.toFixed(2)}s with ${mergedRange.states.length} states`);
+      console.log(`[RangeCache] Merged range: ${mergedRange.startTime.toFixed(2)}-${mergedRange.endTime.toFixed(2)}s with ${mergedRange.states.length} states, ${mergedRange.dynamicObjects.length} dynamic frames`);
       this.ranges.push(mergedRange);
     } else {
       // Evict oldest if at capacity
@@ -250,6 +261,45 @@ class RangeCache {
     }
     allTelemetry.sort((a, b) => a.timestamp - b.timestamp);
     return this.dedupeByTimestamp(allTelemetry);
+  }
+
+  /**
+   * Get all dynamic object frames sorted by timestamp
+   */
+  getAllDynamicObjects(): DynamicObjectFrame[] {
+    const allFrames: DynamicObjectFrame[] = [];
+    for (const range of this.ranges) {
+      allFrames.push(...(range.dynamicObjects || []));
+    }
+    allFrames.sort((a, b) => a.timestamp - b.timestamp);
+    return this.dedupeByTimestamp(allFrames);
+  }
+
+  /**
+   * Get dynamic objects at a specific timestamp (finds closest frame)
+   */
+  getDynamicObjectsAtTime(timestamp: number): SceneEntity[] | null {
+    const allFrames = this.getAllDynamicObjects();
+    if (allFrames.length === 0) return null;
+
+    // Binary search for closest frame
+    let low = 0;
+    let high = allFrames.length - 1;
+
+    while (low < high) {
+      const mid = Math.floor((low + high) / 2);
+      if (allFrames[mid].timestamp < timestamp) {
+        low = mid + 1;
+      } else {
+        high = mid;
+      }
+    }
+
+    // Return closest frame (prefer earlier frame if between two)
+    if (low > 0 && Math.abs(allFrames[low - 1].timestamp - timestamp) < Math.abs(allFrames[low].timestamp - timestamp)) {
+      return allFrames[low - 1].entities;
+    }
+    return allFrames[low].entities;
   }
 
   /**
@@ -361,6 +411,13 @@ export class MCAPLoader {
       decompressHandlers,
     });
     console.log(`[loadIndex] McapIndexedReader.Initialize() took ${(performance.now() - readerInitStart).toFixed(0)}ms`);
+
+    // Log all topics in the MCAP file to understand what data is available
+    console.log('[loadIndex] All topics in MCAP file:');
+    for (const [id, channel] of this.reader.channelsById) {
+      const schema = this.reader.schemasById.get(channel.schemaId);
+      console.log(`  [${id}] ${channel.topic} -> ${schema?.name} (encoding: ${channel.messageEncoding})`);
+    }
 
     // Build index from reader
     const chunkIndexes = [...this.reader.chunkIndexes];
@@ -504,7 +561,6 @@ export class MCAPLoader {
 
     // Debug: log first few messages to understand structure
     let msgCount = 0;
-    const loggedTopics = new Set<string>();
 
     console.log(`[doLoadRange] Starting message iteration...`);
     const iterStartTime = performance.now();
@@ -549,11 +605,60 @@ export class MCAPLoader {
       msgCount++;
     }
 
-    console.log(`[doLoadRange] Message iteration complete: ${msgCount} messages in ${(performance.now() - iterStartTime).toFixed(0)}ms`);
+    console.log(`[doLoadRange] Pose iteration complete: ${msgCount} messages in ${(performance.now() - iterStartTime).toFixed(0)}ms`);
+
+    // Now load dynamic objects (/markers/car and /markers/annotations) for this time range
+    const dynamicObjects: DynamicObjectFrame[] = [];
+    const dynamicIterStart = performance.now();
+    let dynamicMsgCount = 0;
+
+    // Topics that contain dynamic objects (vehicles, pedestrians, etc.)
+    const dynamicTopics = ['/markers/car', '/markers/annotations'];
+    const availableDynamicTopics = this.reader ? dynamicTopics.filter(topic =>
+      Array.from(this.reader!.channelsById.values()).some(ch => ch.topic === topic)
+    ) : [];
+
+    if (availableDynamicTopics.length > 0) {
+      for await (const msg of this.reader.readMessages({
+        startTime: startTimeNs,
+        endTime: endTimeNs,
+        topics: availableDynamicTopics,
+      })) {
+        dynamicMsgCount++;
+        const absoluteTimestamp = Number(msg.logTime) / 1e9;
+        const timestamp = absoluteTimestamp - baseTime;
+        const channel = this.reader.channelsById.get(msg.channelId);
+        const schema = channel ? this.reader.schemasById.get(channel.schemaId) : null;
+
+        if (schema) {
+          try {
+            const decoded = decodeProtobuf(msg.data, schema.data, schema.name);
+            if (decoded && typeof decoded === 'object') {
+              const sceneUpdate = decoded as SceneUpdate;
+              if (sceneUpdate.entities && sceneUpdate.entities.length > 0) {
+                // Find existing frame at this timestamp or create new one
+                let frame = dynamicObjects.find(f => Math.abs(f.timestamp - timestamp) < 0.001);
+                if (!frame) {
+                  frame = { timestamp, entities: [] };
+                  dynamicObjects.push(frame);
+                }
+                // Merge entities from different topics
+                frame.entities.push(...sceneUpdate.entities);
+              }
+            }
+          } catch (err) {
+            // Skip decode errors
+          }
+        }
+      }
+    }
+
+    console.log(`[doLoadRange] Dynamic objects iteration: ${dynamicMsgCount} messages, ${dynamicObjects.length} frames in ${(performance.now() - dynamicIterStart).toFixed(0)}ms`);
 
     // Sort by timestamp
     states.sort((a, b) => a.timestamp - b.timestamp);
     telemetry.sort((a, b) => a.timestamp - b.timestamp);
+    dynamicObjects.sort((a, b) => a.timestamp - b.timestamp);
 
     // Add to cache using relative times
     const relativeStartTime = startTime - baseTime;
@@ -563,6 +668,7 @@ export class MCAPLoader {
       endTime: relativeEndTime,
       states,
       telemetry,
+      dynamicObjects,
     });
 
     // Log loading results for debugging (show relative times)
@@ -969,6 +1075,13 @@ export class MCAPLoader {
   }
 
   /**
+   * Get dynamic objects (other vehicles) at a specific timestamp
+   */
+  getDynamicObjectsAtTime(timestamp: number): SceneEntity[] | null {
+    return this.rangeCache.getDynamicObjectsAtTime(timestamp);
+  }
+
+  /**
    * Get all currently loaded vehicle states
    */
   getAllVehicleStates(): VehicleState[] {
@@ -1166,7 +1279,7 @@ export class MCAPLoader {
 
     if (!this.reader || !this.index) {
       console.warn('[loadMapData] No reader or index available');
-      return { semanticMap: null, drivableArea: null, pointCloud: null, markers: null };
+      return { semanticMap: null, drivableArea: null, pointCloud: null, markers: null, dynamicObjects: null };
     }
 
     const mapData: MapData = {
@@ -1174,6 +1287,7 @@ export class MCAPLoader {
       drivableArea: null,
       pointCloud: null,
       markers: null,
+      dynamicObjects: null,
     };
 
     // Find channels for map-related topics
@@ -1183,8 +1297,8 @@ export class MCAPLoader {
       const schema = this.reader.schemasById.get(channel.schemaId);
       if (!schema) continue;
 
-      // We want: /semantic_map, /drivable_area, /LIDAR_TOP, /markers/annotations
-      if (['/semantic_map', '/drivable_area', '/LIDAR_TOP', '/markers/annotations'].includes(channel.topic)) {
+      // We want: /semantic_map, /drivable_area, /LIDAR_TOP, /markers/annotations, /markers/car
+      if (['/semantic_map', '/drivable_area', '/LIDAR_TOP', '/markers/annotations', '/markers/car'].includes(channel.topic)) {
         topicMap[channel.topic] = {
           channelId: id,
           schemaName: schema.name,
@@ -1254,12 +1368,19 @@ export class MCAPLoader {
           const decoded = decodeProtobuf(msg.data, topicInfo.schemaData, topicInfo.schemaName);
           if (decoded) {
             mapData.markers = decoded as SceneUpdate;
-            console.log(`[loadMapData] /markers decoded in ${(performance.now() - decodeStart).toFixed(0)}ms, entities: ${mapData.markers.entities?.length ?? 0}`);
+            console.log(`[loadMapData] /markers/annotations decoded in ${(performance.now() - decodeStart).toFixed(0)}ms, entities: ${mapData.markers.entities?.length ?? 0}`);
+          }
+        } else if (topic === '/markers/car' && !mapData.dynamicObjects) {
+          const decodeStart = performance.now();
+          const decoded = decodeProtobuf(msg.data, topicInfo.schemaData, topicInfo.schemaName);
+          if (decoded) {
+            mapData.dynamicObjects = decoded as SceneUpdate;
+            console.log(`[loadMapData] /markers/car decoded in ${(performance.now() - decodeStart).toFixed(0)}ms, entities: ${mapData.dynamicObjects.entities?.length ?? 0}`);
           }
         }
 
         // Check if we have all the data we need
-        if (mapData.semanticMap && mapData.drivableArea && mapData.pointCloud && mapData.markers) {
+        if (mapData.semanticMap && mapData.drivableArea && mapData.pointCloud && mapData.markers && mapData.dynamicObjects) {
           break;
         }
       }

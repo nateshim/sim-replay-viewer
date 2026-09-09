@@ -20,6 +20,7 @@ export class SimulationScene {
   private mapGroup: THREE.Group | null = null;
   private pointCloudPoints: THREE.Points | null = null;
   private drivableAreaMesh: THREE.Mesh | null = null;
+  private dynamicObjectsGroup: THREE.Group | null = null;
 
   // Camera follow settings - positioned behind and above the vehicle
   // After base rotation (+90° around Y), offset is transformed:
@@ -216,20 +217,6 @@ export class SimulationScene {
     // Slightly above ground (0.5) to be clearly visible
     const points = positions.map((p) => new THREE.Vector3(p.x, (p.z || 0) + 0.5, -p.y));
 
-    // Debug: log RAW coordinates (before conversion)
-    const firstRaw = positions[0];
-    const lastRaw = positions[positions.length - 1];
-    console.log(`Trajectory RAW: ${positions.length} points`);
-    console.log(`  First RAW (NuScenes): (${firstRaw.x.toFixed(2)}, ${firstRaw.y.toFixed(2)}, ${firstRaw.z.toFixed(2)})`);
-    console.log(`  Last RAW (NuScenes): (${lastRaw.x.toFixed(2)}, ${lastRaw.y.toFixed(2)}, ${lastRaw.z.toFixed(2)})`);
-
-    // Debug: log converted coordinates
-    const first = points[0];
-    const last = points[points.length - 1];
-    console.log(`Trajectory CONVERTED (Three.js): ${points.length} points`);
-    console.log(`  First Three.js: (${first.x.toFixed(2)}, ${first.y.toFixed(2)}, ${first.z.toFixed(2)})`);
-    console.log(`  Last Three.js: (${last.x.toFixed(2)}, ${last.y.toFixed(2)}, ${last.z.toFixed(2)})`);
-
     const geometry = new THREE.BufferGeometry().setFromPoints(points);
 
     // Use a thicker line via LineBasicMaterial (note: linewidth > 1 only works on some systems)
@@ -252,9 +239,6 @@ export class SimulationScene {
     return this.rawTrajectoryPositions;
   }
 
-  // Debug: track last logged time for comparison
-  private lastComparisonLogTime: number = 0;
-
   /**
    * Update vehicle state (called every frame)
    * NuScenes uses ENU: X=East, Y=North, Z=Up
@@ -273,33 +257,6 @@ export class SimulationScene {
       -state.position.y
     );
     this.vehicle.position.copy(this.tempPosition);
-
-    // Debug: compare vehicle position with trajectory periodically
-    const now = performance.now();
-    if (now - this.lastComparisonLogTime > 3000 && this.rawTrajectoryPositions.length > 0) {
-      this.lastComparisonLogTime = now;
-
-      // Find nearest trajectory point by time (assume trajectory is at regular intervals)
-      const trajectoryDuration = 17; // Approximate, from summary
-      const trajIndex = Math.min(
-        Math.floor((state.timestamp / trajectoryDuration) * this.rawTrajectoryPositions.length),
-        this.rawTrajectoryPositions.length - 1
-      );
-      const nearestTrajPoint = this.rawTrajectoryPositions[trajIndex];
-
-      if (nearestTrajPoint) {
-        const distance = Math.sqrt(
-          Math.pow(state.position.x - nearestTrajPoint.x, 2) +
-          Math.pow(state.position.y - nearestTrajPoint.y, 2) +
-          Math.pow(state.position.z - nearestTrajPoint.z, 2)
-        );
-
-        console.log(`[Vehicle vs Trajectory] t=${state.timestamp.toFixed(2)}s`);
-        console.log(`  Vehicle RAW pos: (${state.position.x.toFixed(2)}, ${state.position.y.toFixed(2)}, ${state.position.z.toFixed(2)})`);
-        console.log(`  Trajectory[${trajIndex}] RAW: (${nearestTrajPoint.x.toFixed(2)}, ${nearestTrajPoint.y.toFixed(2)}, ${nearestTrajPoint.z.toFixed(2)})`);
-        console.log(`  Distance: ${distance.toFixed(2)}m`);
-      }
-    }
 
     // Convert quaternion from NuScenes to Three.js
     // NuScenes: rotation around Z-axis (up) for yaw
@@ -405,10 +362,17 @@ export class SimulationScene {
       this.renderPointCloud(mapData.pointCloud);
     }
 
-    // Render markers/annotations
+    // Render markers/annotations (static elements like lane lines, signs)
+    // Note: Cubes (vehicles, pedestrians) are skipped here - rendered dynamically
     if (mapData.markers?.entities) {
-      console.log('Rendering markers with', mapData.markers.entities.length, 'entities');
+      console.log('Rendering markers with', mapData.markers.entities.length, 'entities (cubes rendered dynamically)');
       this.renderSemanticMap(mapData.markers.entities);
+    }
+
+    // Render dynamic objects (other vehicles) - initial frame
+    if (mapData.dynamicObjects?.entities) {
+      console.log('Rendering dynamic objects with', mapData.dynamicObjects.entities.length, 'entities');
+      this.renderDynamicObjects(mapData.dynamicObjects.entities);
     }
 
     this.scene.add(this.mapGroup);
@@ -446,6 +410,21 @@ export class SimulationScene {
       this.drivableAreaMesh.geometry.dispose();
       (this.drivableAreaMesh.material as THREE.Material).dispose();
       this.drivableAreaMesh = null;
+    }
+
+    if (this.dynamicObjectsGroup) {
+      this.scene.remove(this.dynamicObjectsGroup);
+      this.dynamicObjectsGroup.traverse((obj) => {
+        if (obj instanceof THREE.Mesh) {
+          obj.geometry.dispose();
+          if (Array.isArray(obj.material)) {
+            obj.material.forEach((m) => m.dispose());
+          } else if (obj.material) {
+            obj.material.dispose();
+          }
+        }
+      });
+      this.dynamicObjectsGroup = null;
     }
   }
 
@@ -520,39 +499,8 @@ export class SimulationScene {
         }
       }
 
-      // Render cubes (obstacles, etc.)
-      if (entity.cubes && entity.cubes.length > 0) {
-        for (const cube of entity.cubes) {
-          const geometry = new THREE.BoxGeometry(
-            cube.size.x,
-            cube.size.z || 1,
-            cube.size.y
-          );
-
-          const color = cube.color
-            ? new THREE.Color(cube.color.r, cube.color.g, cube.color.b)
-            : new THREE.Color(0xff0000);
-
-          const material = new THREE.MeshBasicMaterial({
-            color,
-            transparent: true,
-            opacity: cube.color?.a ?? 0.8,
-          });
-
-          const mesh = new THREE.Mesh(geometry, material);
-
-          // Position (convert NuScenes to Three.js)
-          if (cube.pose?.position) {
-            mesh.position.set(
-              cube.pose.position.x,
-              (cube.pose.position.z || 0) + (cube.size.z || 1) / 2,
-              -cube.pose.position.y
-            );
-          }
-
-          this.mapGroup.add(mesh);
-        }
-      }
+      // Skip cubes in static map - they are dynamic objects (vehicles, pedestrians)
+      // and will be rendered/updated per-frame via renderDynamicObjects()
     }
   }
 
@@ -665,6 +613,116 @@ export class SimulationScene {
     }
 
     this.mapGroup.add(this.pointCloudPoints);
+  }
+
+  /**
+   * Render dynamic objects (other vehicles, pedestrians)
+   * These are rendered in a separate group so they can be updated per-frame
+   */
+  private renderDynamicObjects(entities: SceneEntity[]): void {
+    // Clear existing dynamic objects
+    if (this.dynamicObjectsGroup) {
+      this.scene.remove(this.dynamicObjectsGroup);
+      this.dynamicObjectsGroup.traverse((obj) => {
+        if (obj instanceof THREE.Mesh) {
+          obj.geometry.dispose();
+          if (Array.isArray(obj.material)) {
+            obj.material.forEach((m) => m.dispose());
+          } else if (obj.material) {
+            obj.material.dispose();
+          }
+        }
+      });
+    }
+
+    this.dynamicObjectsGroup = new THREE.Group();
+    this.dynamicObjectsGroup.name = 'dynamicObjects';
+
+    for (const entity of entities) {
+      // Render cubes (typically used for vehicle bounding boxes)
+      if (entity.cubes && entity.cubes.length > 0) {
+        for (const cube of entity.cubes) {
+          const geometry = new THREE.BoxGeometry(
+            cube.size.x,
+            cube.size.z || 1.5,  // Height
+            cube.size.y
+          );
+
+          // Use orange/yellow for other vehicles to distinguish from ego (blue)
+          const color = cube.color
+            ? new THREE.Color(cube.color.r, cube.color.g, cube.color.b)
+            : new THREE.Color(0xff8800);  // Orange default
+
+          const material = new THREE.MeshStandardMaterial({
+            color,
+            transparent: true,
+            opacity: cube.color?.a ?? 0.8,
+          });
+
+          const mesh = new THREE.Mesh(geometry, material);
+          mesh.castShadow = true;
+
+          // Position (convert NuScenes to Three.js)
+          if (cube.pose?.position) {
+            mesh.position.set(
+              cube.pose.position.x,
+              (cube.pose.position.z || 0) + (cube.size.z || 1.5) / 2,
+              -cube.pose.position.y
+            );
+          }
+
+          // Rotation (convert NuScenes quaternion to Three.js)
+          if (cube.pose?.orientation) {
+            const q = cube.pose.orientation;
+            mesh.quaternion.set(q.x, q.z, -q.y, q.w);
+          }
+
+          this.dynamicObjectsGroup.add(mesh);
+        }
+      }
+
+      // Render models as simple boxes (models have pose info we can use)
+      if (entity.models && entity.models.length > 0) {
+        for (const model of entity.models) {
+          // Create a simple box to represent the vehicle
+          const geometry = new THREE.BoxGeometry(4.5, 2, 1.8); // Typical car dimensions (length, width, height)
+          const material = new THREE.MeshStandardMaterial({
+            color: 0xff6600, // Orange for other vehicles
+            transparent: true,
+            opacity: 0.8,
+          });
+          const mesh = new THREE.Mesh(geometry, material);
+
+          // Position from model pose
+          if (model.pose?.position) {
+            const pos = model.pose.position;
+            // Convert NuScenes ENU to Three.js: x=x, y=z, z=-y
+            mesh.position.set(
+              pos.x,
+              pos.z + 0.9, // Add half height to place on ground
+              -pos.y
+            );
+          }
+
+          // Rotation from model pose
+          if (model.pose?.orientation) {
+            const q = model.pose.orientation;
+            mesh.quaternion.set(q.x, q.z, -q.y, q.w);
+          }
+
+          this.dynamicObjectsGroup.add(mesh);
+        }
+      }
+    }
+
+    this.scene.add(this.dynamicObjectsGroup);
+  }
+
+  /**
+   * Update dynamic objects with new positions (for per-frame updates)
+   */
+  updateDynamicObjects(entities: SceneEntity[]): void {
+    this.renderDynamicObjects(entities);
   }
 
   /**
