@@ -17,6 +17,7 @@ export function useReplay(simulationUrl: string | null) {
     playbackRate: 1,
     isLoading: false,
     isSeeking: false,
+    isBuffering: false,
   });
   const [error, setError] = useState<string | null>(null);
   const [telemetry, setTelemetry] = useState<TelemetryPoint[]>([]);

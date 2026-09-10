@@ -131,6 +131,54 @@ class HttpRangeReader {
 }
 
 /**
+ * Encapsulates a single MCAP reader with its own HTTP connection
+ * Allows multiple readers to operate in parallel on the same file
+ */
+class ReaderInstance {
+  private httpReader: HttpRangeReader | null = null;
+  private reader: McapIndexedReader | null = null;
+  private url: string;
+  private name: string;
+
+  constructor(url: string, name: string = 'unnamed') {
+    this.url = url;
+    this.name = name;
+  }
+
+  async initialize(): Promise<McapIndexedReader> {
+    console.log(`[ReaderInstance:${this.name}] Initializing...`);
+    const startTime = performance.now();
+
+    this.httpReader = new HttpRangeReader(this.url);
+    this.reader = await McapIndexedReader.Initialize({
+      readable: this.httpReader,
+      decompressHandlers,
+    });
+
+    console.log(`[ReaderInstance:${this.name}] Initialized in ${(performance.now() - startTime).toFixed(0)}ms`);
+    return this.reader;
+  }
+
+  getReader(): McapIndexedReader | null {
+    return this.reader;
+  }
+
+  isInitialized(): boolean {
+    return this.reader !== null;
+  }
+
+  abort(): void {
+    this.httpReader?.abort();
+  }
+
+  dispose(): void {
+    this.abort();
+    this.reader = null;
+    this.httpReader = null;
+  }
+}
+
+/**
  * A frame of dynamic objects at a specific timestamp
  */
 interface DynamicObjectFrame {
@@ -317,16 +365,24 @@ class RangeCache {
 /**
  * MCAP file loader with chunked/indexed access
  * Loads data on-demand rather than all at once
+ * Uses multiple reader instances for parallel loading
  */
 export class MCAPLoader {
   private url: string;
-  private httpReader: HttpRangeReader | null = null;
-  private reader: McapIndexedReader | null = null;
   private index: MCAPFileIndex | null = null;
   private rangeCache: RangeCache = new RangeCache(5);
   private schemasInfo: string[] = [];
   private loadingRanges: Map<string, Promise<void>> = new Map();
   private loggedSchemas: Set<string> = new Set();
+
+  // Multiple reader instances for parallel operations
+  private primaryReader: ReaderInstance | null = null;   // Poses/playback (main reader)
+  private mapReader: ReaderInstance | null = null;       // Map data (parallel)
+
+  // Legacy reference for code that still uses this.reader
+  private get reader(): McapIndexedReader | null {
+    return this.primaryReader?.getReader() ?? null;
+  }
 
   // Chunk duration for loading (in seconds)
   private chunkDuration: number = 5;
@@ -391,6 +447,19 @@ export class MCAPLoader {
   }
 
   /**
+   * Get or create the map data reader (for parallel loading)
+   * This reader is dedicated to loading map data while primary reader handles playback
+   */
+  private async getMapReader(): Promise<McapIndexedReader> {
+    if (!this.mapReader) {
+      console.log('[getMapReader] Creating dedicated map reader for parallel loading...');
+      this.mapReader = new ReaderInstance(this.url, 'map');
+      await this.mapReader.initialize();
+    }
+    return this.mapReader.getReader()!;
+  }
+
+  /**
    * Load MCAP file index (metadata only, not message data)
    * This is fast and allows immediate playback UI
    */
@@ -398,31 +467,25 @@ export class MCAPLoader {
     console.log('[loadIndex] Starting...');
     const indexStartTime = performance.now();
 
-    // Abort any previous reader
-    this.httpReader?.abort();
+    // Abort any previous readers
+    this.primaryReader?.abort();
+    this.mapReader?.abort();
 
-    const httpReader = new HttpRangeReader(this.url);
-    this.httpReader = httpReader;
-
-    console.log('[loadIndex] Initializing McapIndexedReader...');
-    const readerInitStart = performance.now();
-    this.reader = await McapIndexedReader.Initialize({
-      readable: httpReader,
-      decompressHandlers,
-    });
-    console.log(`[loadIndex] McapIndexedReader.Initialize() took ${(performance.now() - readerInitStart).toFixed(0)}ms`);
+    // Initialize primary reader
+    this.primaryReader = new ReaderInstance(this.url, 'primary');
+    const reader = await this.primaryReader.initialize();
 
     // Log all topics in the MCAP file to understand what data is available
     console.log('[loadIndex] All topics in MCAP file:');
-    for (const [id, channel] of this.reader.channelsById) {
-      const schema = this.reader.schemasById.get(channel.schemaId);
+    for (const [id, channel] of reader.channelsById) {
+      const schema = reader.schemasById.get(channel.schemaId);
       console.log(`  [${id}] ${channel.topic} -> ${schema?.name} (encoding: ${channel.messageEncoding})`);
     }
 
     // Build index from reader
-    const chunkIndexes = [...this.reader.chunkIndexes];
+    const chunkIndexes = [...reader.chunkIndexes];
     const channels = new Map(
-      Array.from(this.reader.channelsById.entries()).map(([id, ch]) => [
+      Array.from(reader.channelsById.entries()).map(([id, ch]) => [
         id,
         {
           id: ch.id,
@@ -435,7 +498,7 @@ export class MCAPLoader {
     );
 
     const schemas = new Map(
-      Array.from(this.reader.schemasById.entries()).map(([id, schema]) => [
+      Array.from(reader.schemasById.entries()).map(([id, schema]) => [
         id,
         {
           id: schema.id,
@@ -447,7 +510,7 @@ export class MCAPLoader {
     );
 
     // Store schema info for error reporting
-    this.schemasInfo = Array.from(this.reader.schemasById.values()).map(
+    this.schemasInfo = Array.from(reader.schemasById.values()).map(
       (s) => `${s.name} (encoding: ${s.encoding})`
     );
 
@@ -464,7 +527,7 @@ export class MCAPLoader {
     }
 
     // Count messages
-    for (const stats of this.reader.statistics?.channelMessageCounts?.entries() ?? []) {
+    for (const stats of reader.statistics?.channelMessageCounts?.entries() ?? []) {
       messageCount += Number(stats[1]);
     }
 
@@ -1271,16 +1334,20 @@ export class MCAPLoader {
 
   /**
    * Load map data (semantic map, drivable area, point cloud)
+   * Uses dedicated map reader for parallel loading with playback data
    * These are typically static per simulation, so we load them once
    */
   async loadMapData(): Promise<MapData> {
-    console.log('=== MCAPLoader.loadMapData called ===');
+    console.log('=== MCAPLoader.loadMapData called (using dedicated map reader) ===');
     const mapLoadStartTime = performance.now();
 
-    if (!this.reader || !this.index) {
-      console.warn('[loadMapData] No reader or index available');
+    if (!this.index) {
+      console.warn('[loadMapData] No index available');
       return { semanticMap: null, drivableArea: null, pointCloud: null, markers: null, dynamicObjects: null };
     }
+
+    // Get dedicated map reader (creates one if needed, runs parallel with primary)
+    const mapReader = await this.getMapReader();
 
     const mapData: MapData = {
       semanticMap: null,
@@ -1293,8 +1360,8 @@ export class MCAPLoader {
     // Find channels for map-related topics
     const topicMap: Record<string, { channelId: number; schemaName: string; schemaData: Uint8Array }> = {};
 
-    for (const [id, channel] of this.reader.channelsById) {
-      const schema = this.reader.schemasById.get(channel.schemaId);
+    for (const [id, channel] of mapReader.channelsById) {
+      const schema = mapReader.schemasById.get(channel.schemaId);
       if (!schema) continue;
 
       // We want: /semantic_map, /drivable_area, /LIDAR_TOP, /markers/annotations, /markers/car
@@ -1326,14 +1393,14 @@ export class MCAPLoader {
     const iterStartTime = performance.now();
 
     try {
-      for await (const msg of this.reader.readMessages({
+      for await (const msg of mapReader.readMessages({
         topics,
         startTime: startTimeNs,
         endTime: endTimeNs,
       })) {
         messageCount++;
         // Look up channel to get topic name
-        const channel = this.reader.channelsById.get(msg.channelId);
+        const channel = mapReader.channelsById.get(msg.channelId);
         if (!channel) continue;
 
         const topic = channel.topic;
@@ -1400,10 +1467,13 @@ export class MCAPLoader {
    */
   dispose(): void {
     clearProtobufCache();
-    // Abort all in-flight HTTP requests
-    this.httpReader?.abort();
-    this.httpReader = null;
-    this.reader = null;
+
+    // Dispose all reader instances
+    this.primaryReader?.dispose();
+    this.mapReader?.dispose();
+
+    this.primaryReader = null;
+    this.mapReader = null;
     this.index = null;
     this.rangeCache.clear();
     this.loadingRanges.clear();

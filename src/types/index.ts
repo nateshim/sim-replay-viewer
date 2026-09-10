@@ -25,6 +25,7 @@ export interface ReplayState {
   playbackRate: number;
   isLoading: boolean;
   isSeeking: boolean;
+  isBuffering: boolean;  // True when waiting for data to load at current playback position
 }
 
 export interface TelemetryPoint {

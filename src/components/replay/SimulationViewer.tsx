@@ -167,6 +167,12 @@ function SimulationViewer() {
                 <p>Loading simulation...</p>
               </div>
             )}
+            {state.isBuffering && !state.isLoading && (
+              <div className="buffering-overlay">
+                <div className="loading-spinner" />
+                <p>Buffering...</p>
+              </div>
+            )}
           </div>
         </div>
 

@@ -44,6 +44,7 @@ export class ReplayEngine {
       playbackRate: 1,
       isLoading: false,
       isSeeking: false,
+      isBuffering: false,
     };
   }
 
@@ -85,18 +86,29 @@ export class ReplayEngine {
         currentTime: 0,
       });
 
-      // Load initial chunk (around time 0) - this is the only blocking load
-      console.log('[ReplayEngine] Step 2: Loading first chunk (time 0)...');
-      const chunkStartTime = performance.now();
-      await loader.loadTimeRange(0);
-      console.log(`[ReplayEngine] Step 2 complete: First chunk loaded in ${(performance.now() - chunkStartTime).toFixed(0)}ms`);
+      // Step 2: Load first chunk AND map data in PARALLEL
+      // Each uses its own reader instance, so they don't conflict
+      console.log('[ReplayEngine] Step 2: Loading first chunk AND map data in parallel...');
+      const parallelStartTime = performance.now();
+
+      const [/* chunkResult */, mapData] = await Promise.all([
+        loader.loadTimeRange(0),        // Primary reader - poses for playback
+        loader.loadMapData(),           // Map reader - semantic map, drivable area, etc.
+      ]);
+
+      console.log(`[ReplayEngine] Step 2 complete: Parallel load in ${(performance.now() - parallelStartTime).toFixed(0)}ms`);
 
       // Check if disposed during async operation
       if (this.loader !== loader || this.backgroundLoadAborted) {
         return;
       }
 
-      // Mark as loaded - scene can render now with first chunk
+      // Emit map data immediately (loaded in parallel)
+      if (mapData) {
+        this.emit('mapDataUpdate', mapData);
+      }
+
+      // Mark as loaded - scene can render now with first chunk + map
       this.updateState({ isLoading: false });
       this.emit('loaded', { duration: index.duration });
       this.emit('stateChange', this.state);
@@ -110,7 +122,7 @@ export class ReplayEngine {
         this.emit('trajectoryUpdate', initialTrajectory);
       }
 
-      // Start background loading for remaining data
+      // Start background loading for remaining chunks (map already loaded)
       this.startBackgroundLoading(loader);
 
     } catch (error) {
@@ -121,37 +133,15 @@ export class ReplayEngine {
   }
 
   /**
-   * Load trajectory and map data in background without blocking
-   * NOTE: We must serialize these operations because the MCAP reader
-   * doesn't support concurrent message iteration
+   * Load remaining chunks in background
+   * Map data is now loaded in parallel with first chunk (using dedicated reader)
    */
   private async startBackgroundLoading(loader: MCAPLoader): Promise<void> {
-    console.log('[ReplayEngine] Starting background loading...');
+    console.log('[ReplayEngine] Starting background chunk loading...');
 
-    // First proactively load chunks (higher priority for playback)
-    // This needs to complete before map data to avoid reader conflicts
+    // Proactively load remaining chunks for smooth playback
+    // Map data was already loaded in parallel during initial load
     await this.proactivelyLoadChunks(loader);
-
-    // Then load map data (lower priority, static data)
-    this.loadMapDataInBackground(loader);
-  }
-
-  /**
-   * Load map data in background and emit when ready
-   */
-  private async loadMapDataInBackground(loader: MCAPLoader): Promise<void> {
-    try {
-      const mapData = await loader.loadMapData();
-
-      // Check if still valid
-      if (this.loader !== loader || this.backgroundLoadAborted) {
-        return;
-      }
-
-      this.emit('mapDataUpdate', mapData);
-    } catch (err) {
-      console.warn('Background map data load failed:', err);
-    }
   }
 
   /**
@@ -387,7 +377,7 @@ export class ReplayEngine {
 
   /**
    * Start the animation loop
-   * Handles chunked loading and prefetching during playback
+   * Handles chunked loading, buffering, and prefetching during playback
    */
   private startAnimationLoop(): void {
     if (this.animationFrameId !== null) return;
@@ -407,27 +397,55 @@ export class ReplayEngine {
         this.updateState({
           currentTime: this.state.duration,
           isPlaying: false,
+          isBuffering: false,
         });
         this.emit('timeUpdate', { currentTime: this.state.duration });
         this.emit('stateChange', this.state);
         return;
       }
 
-      // Check if we need to load data for current time (with lock to prevent duplicate requests)
-      if (this.loader && !this.loader.hasDataForTime(newTime) && !this.isLoadingCurrentTime) {
-        this.isLoadingCurrentTime = true;
-        this.loader.loadTimeRange(newTime)
-          .then(() => {
-            // Emit trajectory update when new chunk loads
-            const trajectory = this.getTrajectory();
-            this.emit('trajectoryUpdate', trajectory);
-          })
-          .catch((err) => {
-            console.warn('Failed to load data during playback:', err);
-          })
-          .finally(() => {
-            this.isLoadingCurrentTime = false;
-          });
+      // Check if data is available for the new time
+      if (this.loader && !this.loader.hasDataForTime(newTime)) {
+        // Data not available - enter buffering state
+        if (!this.state.isBuffering) {
+          console.log(`[ReplayEngine] Buffering at ${newTime.toFixed(2)}s - waiting for data to load`);
+          this.updateState({ isBuffering: true });
+          this.emit('stateChange', this.state);
+        }
+
+        // Start loading if not already loading
+        if (!this.isLoadingCurrentTime) {
+          this.isLoadingCurrentTime = true;
+          this.loader.loadTimeRange(newTime)
+            .then(() => {
+              // Data loaded - exit buffering and continue playback
+              console.log(`[ReplayEngine] Data loaded for ${newTime.toFixed(2)}s - resuming playback`);
+              this.updateState({ isBuffering: false });
+              this.emit('stateChange', this.state);
+
+              // Emit trajectory update when new chunk loads
+              const trajectory = this.getTrajectory();
+              this.emit('trajectoryUpdate', trajectory);
+            })
+            .catch((err) => {
+              console.warn('Failed to load data during playback:', err);
+              this.updateState({ isBuffering: false });
+              this.emit('stateChange', this.state);
+            })
+            .finally(() => {
+              this.isLoadingCurrentTime = false;
+            });
+        }
+
+        // Don't advance time while buffering - keep the loop running to check when data is ready
+        this.animationFrameId = requestAnimationFrame(loop);
+        return;
+      }
+
+      // Data is available - clear buffering state if it was set
+      if (this.state.isBuffering) {
+        this.updateState({ isBuffering: false });
+        this.emit('stateChange', this.state);
       }
 
       // Prefetch upcoming data more aggressively
