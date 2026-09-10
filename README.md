@@ -9,10 +9,12 @@ This project is a client-side simulation replay tool designed to visualize auton
 **Key capabilities:**
 - Stream and visualize large MCAP files without downloading entirely
 - Real-time 3D vehicle visualization with camera follow
+- Dynamic object rendering (other vehicles, pedestrians) that update per-frame
 - Progressive trajectory loading with chunked data access
+- Parallel loading of map data and playback data using multiple reader instances
+- Buffering system that pauses playback when data isn't loaded, auto-resumes when ready
 - Telemetry sidebar with speed, acceleration, jerk, and yaw rate
 - Timeline scrubbing and arbitrary seeking
-- Variable playback rates (0.5x - 4x)
 - Map visualization (semantic map, drivable area, LIDAR point cloud)
 
 ## Architecture
@@ -25,19 +27,18 @@ This is explicitly a **browser-only application**. There is no backend server. A
 S3 (MCAP files)
        │
        ▼ (HTTP Range Requests)
-┌──────────────────────────────────────────────────────────┐
-│                      Browser                              │
-│  ┌─────────────┐    ┌──────────────┐    ┌─────────────┐  │
-│  │ MCAPLoader  │───▶│ ReplayEngine │───▶│ Three.js    │  │
-│  │ (chunked)   │    │ (time mgmt)  │    │ Scene       │  │
-│  └─────────────┘    └──────────────┘    └─────────────┘  │
-│         │                  │                   │          │
-│         ▼                  ▼                   ▼          │
-│  ┌─────────────┐    ┌──────────────┐    ┌─────────────┐  │
-│  │ RangeCache  │    │ React State  │    │ Vehicle/Map │  │
-│  │ (LRU)       │    │ (UI only)    │    │ Rendering   │  │
-│  └─────────────┘    └──────────────┘    └─────────────┘  │
-└──────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                        Browser                                │
+│  ┌─────────────────┐    ┌──────────────┐    ┌─────────────┐  │
+│  │   MCAPLoader    │───▶│ ReplayEngine │───▶│  Three.js   │  │
+│  │ (multi-reader)  │    │ (time mgmt)  │    │   Scene     │  │
+│  └─────────────────┘    └──────────────┘    └─────────────┘  │
+│    │           │               │                   │          │
+│    ▼           ▼               ▼                   ▼          │
+│ Primary    Map Reader    React State         Vehicle/Map     │
+│ Reader     (parallel)    (UI only)           + Dynamic       │
+│ (poses)                                      Objects         │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 **Why no backend?**
@@ -50,42 +51,51 @@ S3 (MCAP files)
 
 #### 1. MCAP Loader (`src/mcap/loader.ts`)
 
-The loader handles efficient access to large MCAP files:
+The loader handles efficient access to large MCAP files using **multiple reader instances** for parallel loading:
 
 ```typescript
-// Key concepts:
-// 1. Index-first loading - metadata only, no message data
-// 2. HTTP Range Requests - fetch only needed chunks
-// 3. LRU Cache - bounded memory for loaded ranges
-// 4. Protobuf decoding - on-demand schema compilation
+// Multiple reader instances for parallel operations
+private primaryReader: ReaderInstance;   // Poses/playback data
+private mapReader: ReaderInstance;       // Map data (parallel)
 
 class MCAPLoader {
-  async loadIndex(): Promise<MCAPFileIndex>     // Fast - metadata only
-  async loadTimeRange(time: number): Promise<void>  // Load chunk for time
-  getStateAtTime(time: number): VehicleState | null // Interpolated lookup
+  async loadIndex(): Promise<MCAPFileIndex>          // Fast - metadata only
+  async loadTimeRange(time: number): Promise<void>   // Load chunk for time
+  async loadMapData(): Promise<MapData>              // Uses dedicated reader
+  getStateAtTime(time: number): VehicleState | null  // Interpolated lookup
+  getDynamicObjectsAtTime(time: number): SceneEntity[] | null  // Other vehicles
 }
 ```
 
 **Design decisions:**
-- **Chunked loading**: Files are loaded in 5-second chunks around the requested time
+- **Multiple reader instances**: Map data loads in parallel with playback data (4-5x faster initial load)
+- **Topic filtering**: Only loads pose topics (`/pose`, `/pose/imu`, etc.) for playback, not LIDAR/map data
+- **Chunked loading**: Files loaded in 5-second chunks around requested time
 - **3-concurrent HTTP limit**: Balances speed vs browser resource limits
 - **Protobuf schema caching**: Schemas compiled once, reused for all messages
+- **Dynamic objects per-chunk**: `/markers/annotations` loaded with each chunk for moving vehicles
 
 #### 2. Replay Engine (`src/replay/ReplayEngine.ts`)
 
-Manages simulation time separately from render time:
+Manages simulation time separately from render time, with **buffering support**:
 
 ```typescript
 // Simulation time advances based on wall-clock time, not frames
 currentTime += deltaTime * playbackRate;
 
-// This ensures correct playback at any FPS (30, 60, 120, etc.)
+// Buffering: pause when data isn't available, auto-resume when loaded
+if (!loader.hasDataForTime(newTime)) {
+  updateState({ isBuffering: true });
+  await loader.loadTimeRange(newTime);
+  updateState({ isBuffering: false });
+  // Playback automatically continues
+}
 ```
 
 **Event-driven architecture:**
 ```typescript
 type ReplayEventType =
-  | 'stateChange'      // Playback state changed
+  | 'stateChange'      // Playback state changed (includes isBuffering)
   | 'timeUpdate'       // Current time updated
   | 'loaded'           // Initial load complete
   | 'trajectoryUpdate' // New trajectory data available
@@ -93,15 +103,14 @@ type ReplayEventType =
   | 'chunkLoaded';     // Background chunk loaded
 ```
 
-**Progressive loading flow:**
+**Progressive loading flow (with parallel loading):**
 1. Load index (fast - metadata only)
-2. Load first chunk (blocking - needed for initial render)
-3. Emit `loaded` - UI can render immediately
+2. **In parallel:**
+   - Load first chunk (poses for playback)
+   - Load map data (semantic map, LIDAR, drivable area)
+3. Emit `loaded` - UI can render immediately with map + vehicle
 4. Background: load remaining chunks sequentially
-5. Background: load map data (semantic map, LIDAR, etc.)
-
-**Why serialize background loading?**
-The MCAP reader (`McapIndexedReader`) doesn't support concurrent message iteration. Running `loadMapData()` and `proactivelyLoadChunks()` in parallel causes one to hang. They must run sequentially.
+5. During playback: buffer if data not available, auto-resume when loaded
 
 #### 3. Three.js Scene (`src/three/scene/SimulationScene.ts`)
 
@@ -119,10 +128,16 @@ threePosition.set(nuscenes.x, nuscenes.z, -nuscenes.y);
 threeQuat.set(ns.x, ns.z, -ns.y, ns.w);
 ```
 
+**Dynamic objects rendering:**
+- Other vehicles and pedestrians from `/markers/annotations` rendered as colored cubes
+- Updated every frame based on current playback time
+- Separate group (`dynamicObjectsGroup`) for efficient updates
+
 **Performance considerations:**
 - Reusable `THREE.Vector3`/`Quaternion` objects to avoid GC in animation loop
 - Camera follows vehicle with lerp smoothing
 - Map objects properly disposed when cleared
+- Dynamic objects cleared and recreated each frame (simple approach, works well)
 
 #### 4. React Integration (`src/hooks/useReplay.ts`)
 
@@ -134,6 +149,7 @@ Bridges the imperative ReplayEngine with React's declarative model:
 
 engine.on('stateChange', (newState) => setState(newState));
 engine.on('trajectoryUpdate', (traj) => setFullTrajectory(traj));
+engine.on('mapDataUpdate', (map) => setMapData(map));
 ```
 
 **State update throttling:**
@@ -149,34 +165,36 @@ The engine throttles React state updates to ~10/second (`STATE_EMIT_INTERVAL = 1
 │  └─────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────┘
                               │
-                              ▼ Range Request (Index + Target Chunk)
+          ┌───────────────────┴───────────────────┐
+          ▼                                       ▼
+┌──────────────────────┐              ┌──────────────────────┐
+│   Primary Reader     │              │     Map Reader       │
+│ (poses, dynamics)    │   PARALLEL   │ (semantic, LIDAR)    │
+└──────────────────────┘              └──────────────────────┘
+          │                                       │
+          └───────────────────┬───────────────────┘
+                              ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                        MCAPLoader                                │
-│  ┌──────────────┐   ┌──────────────┐   ┌──────────────────┐    │
-│  │ loadIndex()  │──▶│ loadTimeRange│──▶│ parseVehicleState│    │
-│  │ (schemas,    │   │ (decompress, │   │ (protobuf decode)│    │
-│  │  channels)   │   │  iterate)    │   │                  │    │
-│  └──────────────┘   └──────────────┘   └──────────────────┘    │
-│         │                   │                    │              │
-│         ▼                   ▼                    ▼              │
 │  ┌─────────────────────────────────────────────────────────┐   │
 │  │                    RangeCache (LRU)                      │   │
-│  │  Range 0-5s: [VehicleState, VehicleState, ...]          │   │
-│  │  Range 5-10s: [VehicleState, VehicleState, ...]         │   │
+│  │  Range 0-5s: [VehicleState...] + [DynamicObjectFrame...] │   │
+│  │  Range 5-10s: [VehicleState...] + [DynamicObjectFrame...]│   │
 │  └─────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────┘
                               │
-                              ▼ getStateAtTime(t) with interpolation
+                              ▼ getStateAtTime(t), getDynamicObjectsAtTime(t)
 ┌─────────────────────────────────────────────────────────────────┐
 │                       ReplayEngine                               │
 │  ┌───────────────────────────────────────────────────────────┐  │
 │  │ Animation Loop (requestAnimationFrame)                     │  │
 │  │   1. Calculate deltaTime                                   │  │
-│  │   2. Advance currentTime += deltaTime * playbackRate       │  │
-│  │   3. Check if chunk needed, load if not cached             │  │
-│  │   4. Prefetch upcoming chunks                              │  │
-│  │   5. Emit timeUpdate event                                 │  │
-│  │   6. Throttled: emit stateChange for React                 │  │
+│  │   2. Check if data available for newTime                   │  │
+│  │      - If not: set isBuffering=true, load data, wait       │  │
+│  │      - If yes: advance currentTime                         │  │
+│  │   3. Prefetch upcoming chunks                              │  │
+│  │   4. Emit timeUpdate event                                 │  │
+│  │   5. Throttled: emit stateChange for React                 │  │
 │  └───────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
                               │
@@ -184,8 +202,12 @@ The engine throttles React state updates to ~10/second (`STATE_EMIT_INTERVAL = 1
             ▼                 ▼                 ▼
 ┌───────────────────┐ ┌─────────────┐ ┌──────────────────┐
 │   Three.js Scene  │ │ React State │ │ Telemetry/Charts │
-│ (60 FPS updates)  │ │ (10 Hz max) │ │                  │
-└───────────────────┘ └─────────────┘ └──────────────────┘
+│ - Vehicle         │ │ (10 Hz max) │ │                  │
+│ - Dynamic Objects │ │ - isPlaying │ │                  │
+│ - Trajectory      │ │ - isBuffer- │ │                  │
+│ - Map             │ │   ing       │ │                  │
+│ (60 FPS updates)  │ └─────────────┘ └──────────────────┘
+└───────────────────┘
 ```
 
 ## Project Structure
@@ -197,21 +219,21 @@ src/
 ├── types/
 │   └── index.ts               # Core domain types (VehicleState, ReplayState, etc.)
 ├── mcap/
-│   ├── loader.ts              # MCAP file loading with chunked HTTP access
+│   ├── loader.ts              # MCAP file loading with multi-reader parallel access
 │   ├── protobufDecoder.ts     # Protobuf schema parsing and message decoding
 │   └── types.ts               # MCAP-specific types (SceneUpdate, Grid, PointCloud)
 ├── replay/
-│   └── ReplayEngine.ts        # Core playback engine (time management, events)
+│   └── ReplayEngine.ts        # Core playback engine (time management, buffering, events)
 ├── three/
 │   └── scene/
-│       └── SimulationScene.ts # Three.js 3D scene (vehicle, trajectory, map)
+│       └── SimulationScene.ts # Three.js 3D scene (vehicle, trajectory, map, dynamic objects)
 ├── hooks/
 │   ├── useReplay.ts           # React hook bridging ReplayEngine to components
 │   └── useFrameRate.ts        # FPS measurement hook
 ├── components/
 │   ├── replay/
 │   │   ├── SimulationViewer.tsx  # Main viewer page
-│   │   └── PlaybackControls.tsx  # Play/pause, skip, speed controls
+│   │   └── PlaybackControls.tsx  # Play/pause, skip controls
 │   ├── timeline/
 │   │   └── Timeline.tsx          # Scrubbing timeline
 │   ├── telemetry/
@@ -227,21 +249,76 @@ src/
 
 ## Key Design Decisions
 
-### 1. MCAP Indexing Over Full Download
+### 1. Multiple Reader Instances for Parallel Loading
 
-MCAP files can be hundreds of MB. Instead of downloading entirely:
+The MCAP reader doesn't support concurrent message iteration on a single instance. Solution: create separate reader instances:
 
 ```typescript
-// Load index first (small, contains chunk offsets)
-const index = await loader.loadIndex();
+// Before: Sequential loading (~7+ seconds to see map)
+await loadTimeRange(0);      // Primary reader
+await proactiveChunks();     // Primary reader (blocks map)
+await loadMapData();         // Primary reader
 
-// On seek to time T, load only the relevant chunk
-await loader.loadTimeRange(targetTime);
+// After: Parallel loading (~1.7 seconds to see map)
+await Promise.all([
+  loadTimeRange(0),   // Primary reader
+  loadMapData(),      // Dedicated map reader (parallel!)
+]);
 ```
 
-This enables instant startup and efficient seeking.
+This reduces initial load time by 4-5x.
 
-### 2. Separation of Simulation Time and Render Time
+### 2. Topic Filtering for Faster Chunk Loading
+
+MCAP files contain many topics (LIDAR, map data, poses, etc.). Loading all topics for playback is wasteful:
+
+```typescript
+// Only load pose-related topics for playback chunks
+const poseTopics = ['/pose', '/pose/imu', '/pose/filtered', ...];
+
+await reader.readMessages({
+  topics: poseTopics,  // Not all 40+ topics
+  startTime, endTime
+});
+```
+
+This dramatically reduces HTTP requests and load time per chunk.
+
+### 3. Buffering System
+
+Playback pauses automatically when data isn't available, preventing visual glitches:
+
+```typescript
+// In animation loop:
+if (!loader.hasDataForTime(newTime)) {
+  // Don't advance time - enter buffering state
+  updateState({ isBuffering: true });
+
+  // Load data in background
+  await loader.loadTimeRange(newTime);
+
+  // Auto-resume playback
+  updateState({ isBuffering: false });
+}
+```
+
+UI shows "Buffering..." overlay when waiting for data.
+
+### 4. Dynamic Objects (Other Vehicles)
+
+Other vehicles from `/markers/annotations` are:
+- Loaded per-chunk (not just at startup)
+- Stored with timestamps in RangeCache
+- Looked up by current playback time
+- Rendered as colored cubes that update every frame
+
+```typescript
+// Per-frame update in animation loop:
+const dynamicObjects = loader.getDynamicObjectsAtTime(currentTime);
+scene.updateDynamicObjects(dynamicObjects);
+```
+
+### 5. Separation of Simulation Time and Render Time
 
 ```typescript
 // BAD: Time tied to frames (wrong speed at different FPS)
@@ -252,41 +329,24 @@ const deltaTime = (performance.now() - lastUpdate) / 1000;
 currentTime += deltaTime * playbackRate;
 ```
 
-### 3. React for UI, Three.js for Rendering
+### 6. React for UI, Three.js for Rendering
 
 React handles:
 - Playback controls
 - Timeline
 - Telemetry sidebar
-- Loading states
+- Loading/buffering states
 
 Three.js handles (imperatively, not through React):
 - Vehicle position/rotation (60 FPS)
+- Dynamic objects (60 FPS)
 - Camera following
 - Trajectory line
 - Map rendering
 
 This separation prevents React re-renders from affecting render performance.
 
-### 4. Progressive Loading
-
-Instead of blocking until all data loads:
-
-1. Load minimal data for initial render (~5 seconds)
-2. Show UI immediately
-3. Load remaining chunks in background
-4. Emit events as data becomes available
-
-```typescript
-// User sees something quickly
-await loader.loadTimeRange(0);
-emit('loaded');
-
-// Rest loads without blocking
-this.startBackgroundLoading(loader);
-```
-
-### 5. Coordinate System Conversion
+### 7. Coordinate System Conversion
 
 NuScenes uses ENU (East-North-Up), Three.js uses a different convention:
 
@@ -330,21 +390,29 @@ npx tsc --noEmit
 npm run lint
 ```
 
+## Performance Characteristics
+
+| Operation | Time (typical) |
+|-----------|----------------|
+| Load index | ~200ms |
+| First chunk + map (parallel) | ~1.5-2s |
+| Per-chunk load (during playback) | ~500ms |
+| Seek to unloaded time | ~500ms + buffering |
+
 ## Known Limitations
 
-1. **First chunk load time**: Initial load can take up to a minute due to:
-   - MCAP index initialization (multiple HTTP round-trips)
-   - Protobuf schema compilation (FileDescriptorSet parsing)
-   - S3 latency
+1. **MCAP reader concurrency**: Each `McapIndexedReader` instance doesn't support concurrent iteration. Solved with multiple reader instances, but adds memory overhead.
 
-2. **MCAP reader concurrency**: The `McapIndexedReader` doesn't support concurrent message iteration, so background operations must be serialized.
+2. **Dynamic object rendering**: Currently clears and recreates all dynamic object meshes each frame. Works well but could be optimized with object pooling.
 
 3. **Line width**: Three.js `LineBasicMaterial` linewidth > 1 only works on some systems (WebGL limitation).
 
+4. **Point cloud size**: Large LIDAR point clouds (~57k points) can impact initial render. Consider downsampling for very large clouds.
+
 ## Future Improvements
 
-- Pre-compile protobuf schemas or use schema caching across sessions
-- Parallel index loading with worker threads
+- Object pooling for dynamic objects (avoid per-frame mesh creation)
 - WebGL instanced rendering for large point clouds
-- Compressed trajectory transmission
-- Offline caching with IndexedDB
+- Pre-compile protobuf schemas or use schema caching across sessions
+- Offline caching with IndexedDB for repeat views
+- Trajectory downsampling for initial overview (load full detail progressively)
