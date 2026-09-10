@@ -2,21 +2,15 @@ import './PlaybackControls.css';
 
 interface PlaybackControlsProps {
   isPlaying: boolean;
-  playbackRate: number;
   onPlayPause: () => void;
   onSkip: (seconds: number) => void;
-  onPlaybackRateChange: (rate: number) => void;
 }
 
 function PlaybackControls({
   isPlaying,
-  playbackRate,
   onPlayPause,
   onSkip,
-  onPlaybackRateChange,
 }: PlaybackControlsProps) {
-  const playbackRates = [0.25, 0.5, 1, 1.5, 2, 4];
-
   return (
     <div className="playback-controls">
       <div className="controls-left">
@@ -55,22 +49,6 @@ function PlaybackControls({
             <path d="M4 18l8.5-6L4 6v12zm9-12v12l8.5-6L13 6z" />
           </svg>
         </button>
-      </div>
-
-      <div className="controls-right">
-        <div className="playback-rate">
-          <label>Speed:</label>
-          <select
-            value={playbackRate}
-            onChange={(e) => onPlaybackRateChange(parseFloat(e.target.value))}
-          >
-            {playbackRates.map((rate) => (
-              <option key={rate} value={rate}>
-                {rate}x
-              </option>
-            ))}
-          </select>
-        </div>
       </div>
     </div>
   );

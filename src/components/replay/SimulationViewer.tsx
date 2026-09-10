@@ -27,7 +27,6 @@ function SimulationViewer() {
     togglePlayPause,
     seek,
     skip,
-    setPlaybackRate,
     getCurrentVehicleState,
     getCurrentDynamicObjects,
   } = useReplay(simulationUrl);
@@ -190,10 +189,8 @@ function SimulationViewer() {
         <div className="controls-section">
           <PlaybackControls
             isPlaying={state.isPlaying}
-            playbackRate={state.playbackRate}
             onPlayPause={togglePlayPause}
             onSkip={skip}
-            onPlaybackRateChange={setPlaybackRate}
           />
         </div>
         <div className="timeline-section">

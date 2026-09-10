@@ -1,7 +1,7 @@
 .playback-controls {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: center;
   height: 100%;
   padding: 0 16px;
 }
@@ -10,12 +10,6 @@
   display: flex;
   align-items: center;
   gap: 8px;
-}
-
-.controls-right {
-  display: flex;
-  align-items: center;
-  gap: 16px;
 }
 
 .control-btn {
@@ -61,26 +55,4 @@
 .skip-btn svg {
   width: 20px;
   height: 20px;
-}
-
-.playback-rate {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 13px;
-  color: #888;
-}
-
-.playback-rate select {
-  background: rgba(255, 255, 255, 0.1);
-  border: 1px solid rgba(255, 255, 255, 0.2);
-  color: #eaeaea;
-  padding: 4px 8px;
-  border-radius: 4px;
-  font-size: 13px;
-  cursor: pointer;
-}
-
-.playback-rate select:hover {
-  background: rgba(255, 255, 255, 0.15);
 }
